@@ -13,6 +13,7 @@ import json
 import os
 
 from kafka import KafkaConsumer, KafkaProducer
+from preprocessing import FEATURE_COLUMNS, PreprocessingError, preprocess
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS_HOST", "localhost:29092")
 TOPIC_IN = os.getenv("TOPIC_TELEMETRY_RAW", "iomt.telemetry.raw")
@@ -37,15 +38,23 @@ def main():
     for message in consumer:
         record = message.value
 
-        # TODO: replace with real preprocessing
-        cleaned = record
+        # preprocessing: raw message -> (identifing metadata, allowing numeric vector).
+        # A record we cant vectorize is skipped and not allowed to crash the stream
+        try:
+            meta, features = preprocess(record)
+        except PreprocessingError as exc:
+            print(f"Skipping unusable record: {exc}")
+            continue
 
         # TODO: replace with real model inference (import from ml/)
         risk_score = 0  # placeholder
 
-        cleaned["risk_score"] = risk_score
-        producer.send(TOPIC_OUT, cleaned)
-        print(f"Scored record: risk_score={risk_score}")
+        # Keeps the original record (so the dashboard still has vulnerablity flags, remediation tips ans so on) and attach what preprocessing produced.
+        scored = dict(record)
+        scored["features"] = dict(zip(FEATURE_COLUMNS, features))
+        scored["risk_score"] = risk_score
+        producer.send(TOPIC_OUT, scored)
+        print(f"Scored {meta['device_id']} ({meta['device_type']}): risk_score={risk_score}")
 
 
 if __name__ == "__main__":
