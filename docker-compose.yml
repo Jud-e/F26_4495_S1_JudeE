@@ -79,6 +79,20 @@ services:
       - ./dashboard-api:/app   # live code reload while developing
     command: uvicorn main:app --host 0.0.0.0 --port 8100 --reload
 
+  # --- Stream preprocessing + scoring (David's consumer) ---
+  stream-consumer:
+    build:
+      context: ./stream
+    container_name: stream-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS_HOST: ${KAFKA_BOOTSTRAP_SERVERS_INTERNAL:-kafka:9092}
+      TOPIC_TELEMETRY_RAW: ${TOPIC_TELEMETRY_RAW:-iomt.telemetry.raw}
+      TOPIC_TELEMETRY_SCORED: ${TOPIC_TELEMETRY_SCORED:-iomt.telemetry.scored}
+
   # --- Postgres for storing device metadata / risk scores ---
   db:
     image: postgres:16-alpine
