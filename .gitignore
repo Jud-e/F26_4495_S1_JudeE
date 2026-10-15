@@ -34,3 +34,6 @@ Thumbs.db
 # Gateway (private key)
 gateway/key.pem
 gateway/cert.pem
+
+mkcert.exe
+test_payload.json
