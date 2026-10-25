@@ -62,6 +62,36 @@ services:
       - ./data:/app/data:ro   # patient registry (read-only — gateway doesn't modify it)
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --ssl-keyfile=/app/key.pem --ssl-certfile=/app/cert.pem
 
+# --- Dashboard API (reads scored telemetry, serves the live SOC page) ---
+  dashboard-api:
+    build:
+      context: ./dashboard-api
+    container_name: dashboard-api
+    depends_on:
+      - kafka
+    ports:
+      - "8100:8100"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS_INTERNAL:-kafka:9092}
+      TOPIC_TELEMETRY_SCORED: ${TOPIC_TELEMETRY_SCORED:-iomt.telemetry.scored}
+      RISK_ALERT_THRESHOLD: ${RISK_ALERT_THRESHOLD:-70}
+    volumes:
+      - ./dashboard-api:/app   # live code reload while developing
+    command: uvicorn main:app --host 0.0.0.0 --port 8100 --reload
+
+  # --- Stream preprocessing + scoring (David's consumer) ---
+  stream-consumer:
+    build:
+      context: ./stream
+    container_name: stream-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS_HOST: ${KAFKA_BOOTSTRAP_SERVERS_INTERNAL:-kafka:9092}
+      TOPIC_TELEMETRY_RAW: ${TOPIC_TELEMETRY_RAW:-iomt.telemetry.raw}
+      TOPIC_TELEMETRY_SCORED: ${TOPIC_TELEMETRY_SCORED:-iomt.telemetry.scored}
 
   # --- Postgres for storing device metadata / risk scores ---
   db:
