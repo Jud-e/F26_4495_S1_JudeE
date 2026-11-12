@@ -4,6 +4,10 @@ Persistence tests against a real Postgres.
     DATABASE_URL=postgresql://user@host/medguard python3 dashboard-api/test_persistence.py
 
 Skips (exit 0) when DATABASE_URL is not set. Run from the repository root.
+
+The database named in DATABASE_URL must end in "_test" (for example medguard_test). The test
+creates it if it is missing and drops and recreates its tables, so it refuses to run against
+anything else, which keeps your demo data safe.
 """
 import os, sys
 URL = os.environ.get("DATABASE_URL")
@@ -14,7 +18,20 @@ os.environ["DB_CONNECT_ATTEMPTS"] = "1"
 sys.path.insert(0, "dashboard-api")
 from fastapi.testclient import TestClient
 import psycopg
+import psycopg.sql
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 import auth, main
+
+# ---- make sure the test database exists, and refuse to touch any other one ----
+_info = conninfo_to_dict(URL)
+_dbname = _info.get("dbname", "")
+if not _dbname.endswith("_test"):
+    sys.exit(f"Refusing to run: database '{_dbname}' does not end in _test. "
+             "This test drops tables, so point DATABASE_URL at a throwaway database such as medguard_test.")
+with psycopg.connect(make_conninfo(**{**_info, "dbname": "postgres"}), autocommit=True) as _admin:
+    if not _admin.execute("SELECT 1 FROM pg_database WHERE datname = %s", (_dbname,)).fetchone():
+        _admin.execute(psycopg.sql.SQL("CREATE DATABASE {}").format(psycopg.sql.Identifier(_dbname)))
+        print(f"created database {_dbname}")
 
 H = lambda t: {"Authorization": f"Bearer {t}"}
 base = {"message_id": "m1", "device_id": "infusion-pump-001", "device_type": "infusion_pump", "patient_id": "P-1",
