@@ -2,7 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { getToken, getUser, homeFor } from "./api";
-import { ToastProvider } from "./components/Toasts";
+import { ToastProvider } from "./components/toasts";
 import Admin from "./pages/Admin";
 import Login from "./pages/Login";
 import Nurse from "./pages/Nurse";

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "../api";
 import { TopBar } from "../components/parts";
-import { useToast } from "../components/Toasts";
+import { useToast } from "../components/toasts";
 import { ago, plain, readings } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
 import type { Alert, Device, User } from "../types";

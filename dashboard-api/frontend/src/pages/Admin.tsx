@@ -29,7 +29,7 @@ function AlertRow({ a }: { a: Alert }) {
 function DevicesTable({ devices }: { devices: Device[] }) {
   const [busy, setBusy] = useState("");
   async function toggle(d: Device) {
-    if (!d.isolated && !window.confirm(`Isolate ${d.device_id}? Its traffic should be blocked until restored.`)) return;
+    if (!d.isolated && !window.confirm(`Isolate ${d.device_id}? The gateway will refuse its messages until you restore it.`)) return;
     setBusy(d.device_id);
     try { await api(`/api/devices/${encodeURIComponent(d.device_id)}/${d.isolated ? "restore" : "isolate"}`, { method: "POST" }); }
     catch (e) { window.alert((e as Error).message); }
@@ -158,7 +158,7 @@ export default function Admin({ user }: { user: User }) {
           <section role="tabpanel" className="panel">
             <h2>All devices</h2>
             <DevicesTable devices={devices} />
-            <p className="note">Isolating a device is recorded and audited here. Enforcement at the gateway is not connected yet.</p>
+            <p className="note">Isolating a device makes the gateway refuse its messages (HTTP 403) until you restore it. Every command is audited.</p>
           </section>
         )}
 

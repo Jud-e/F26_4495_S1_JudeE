@@ -1,5 +1,6 @@
 import os, sys
 os.environ["DISABLE_KAFKA"] = "1"
+os.environ["DATABASE_URL"] = ""   # these tests are in-memory only; never touch a real database
 sys.path.insert(0, "dashboard-api")
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -101,4 +102,31 @@ with TestClient(main.app) as c:
     assert c.get("/api/me", headers=hdr(N)).status_code == 401
     devs = c.get("/api/devices", headers=hdr(A)).json()
     assert [d["device_id"] for d in devs] == ["cardiac-monitor-001", "infusion-pump-001"], devs
+
+# ---- isolation goes through the actions topic ----
+sent = []
+with TestClient(main.app) as c:
+    A = login(c, "admin", "admin123").json()["token"]
+    c.portal.call(main.process, dict(base, message_id="z1", device_id="infusion-pump-002"))
+    os.environ["DISABLE_KAFKA"] = "0"               # exercise the Kafka path with a fake publisher
+    main.publish_action = lambda ev: sent.append(ev)
+    assert c.post("/api/devices/infusion-pump-002/isolate", headers=hdr(A)).status_code == 200
+    assert sent[0]["device_id"] == "infusion-pump-002" and sent[0]["isolated"] is True and sent[0]["by"] == "admin"
+    assert not main.isolated.get("infusion-pump-002")            # nothing changes until the command is read back
+    c.portal.call(main.apply_action, sent[0])
+    assert main.isolated["infusion-pump-002"] is True and main.devices["infusion-pump-002"]["isolated"] is True
+
+    def boom(ev): raise RuntimeError("kafka down")
+    main.publish_action = boom
+    assert c.post("/api/devices/infusion-pump-002/restore", headers=hdr(A)).status_code == 503
+    assert main.isolated["infusion-pump-002"] is True            # a failed command changes nothing
+    assert "isolation_failed" in [e["action"] for e in c.get("/api/audit", headers=hdr(A)).json()]
+
+    # a command for a device we have not seen yet is remembered and applied when it appears
+    c.portal.call(main.apply_action, {"device_id": "cardiac-monitor-002", "isolated": True})
+    c.portal.call(main.process, dict(base, message_id="z2", device_id="cardiac-monitor-002", device_type="cardiac_monitor"))
+    assert main.devices["cardiac-monitor-002"]["isolated"] is True
+    c.portal.call(main.apply_action, {"device_id": "x", "isolated": "yes"})   # malformed commands are ignored
+    assert "x" not in main.isolated
+    os.environ["DISABLE_KAFKA"] = "1"
 print("all dashboard-api checks passed")
