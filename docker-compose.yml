@@ -95,7 +95,7 @@ services:
       TOPIC_TELEMETRY_SCORED: ${TOPIC_TELEMETRY_SCORED:-iomt.telemetry.scored}
       TOPIC_ACTIONS: ${TOPIC_ACTIONS:-iomt.actions}
       RISK_ALERT_THRESHOLD: ${RISK_ALERT_THRESHOLD:-70}
-      DATABASE_URL: postgresql://medguard:${POSTGRES_PASSWORD:-medguard_dev}@db:5432/medguard
+      DATABASE_URL: postgresql://medguard:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/medguard
     volumes:
       - ./dashboard-api:/app   # live code reload while developing
     command: uvicorn main:app --host 0.0.0.0 --port 8100 --reload
@@ -120,10 +120,10 @@ services:
     container_name: iomt-db
     environment:
       POSTGRES_USER: medguard
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medguard_dev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: medguard
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
