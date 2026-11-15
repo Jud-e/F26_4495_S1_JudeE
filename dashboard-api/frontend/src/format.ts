@@ -31,3 +31,12 @@ const PLAIN: Record<string, string> = {
   high_risk_score: "Device is behaving unusually",
 };
 export const plain = (r: string) => PLAIN[r] || r.replace(/_/g, " ");
+
+// The detection model explains a high score as "<reading> = <value> (normal <low> to <high>)".
+const READING_LABEL: Record<string, string> = {
+  packet_size_bytes: "Message size (bytes)", request_rate_per_min: "Messages per minute",
+  infusion_rate_ml_per_hr: "Infusion rate (mL/hr)", occlusion_pressure_mmHg: "Occlusion pressure (mmHg)",
+  battery_pct: "Battery (%)", heart_rate_bpm: "Heart rate (bpm)", spo2_pct: "Oxygen saturation (%)",
+  systolic_bp_mmHg: "Systolic blood pressure (mmHg)", diastolic_bp_mmHg: "Diastolic blood pressure (mmHg)",
+};
+export const explain = (s: string) => s.replace(/^(\w+) = /, (_m, k: string) => (READING_LABEL[k] ?? k) + " = ");

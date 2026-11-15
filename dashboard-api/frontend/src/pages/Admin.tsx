@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { Chips, DeviceLabel, RiskCell, TopBar } from "../components/parts";
-import { ago, clock, readings } from "../format";
+import { ago, clock, explain, readings } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
 import type { Alert, AuditEntry, Device, User } from "../types";
 
@@ -21,6 +21,7 @@ function AlertRow({ a }: { a: Alert }) {
         <span className="sub">{ago(a.at)} · risk {a.risk_score}</span>
       </div>
       <Chips items={a.reasons} />
+      {a.explanations?.map((e) => <div key={e} className="sub">Why: {explain(e)}</div>)}
       <div className="sub">{a.ack ? `Acknowledged by ${a.ack.by} ${ago(a.ack.at)}` : "Not yet acknowledged"}</div>
     </li>
   );

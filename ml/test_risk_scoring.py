@@ -17,7 +17,7 @@ sys.path.insert(0, str(HERE))
 from make_synthetic_data import generate  # noqa: E402
 from preprocessing import FEATURE_COLUMNS, preprocess  # noqa: E402
 from risk_scoring import (  # noqa: E402
-    ALERT_THRESHOLD, RiskScorer, fit_calibration, score_to_risk, scores_to_risk,
+    ALERT_THRESHOLD, RiskScorer, fit_calibration, fit_envelope, score_to_risk, scores_to_risk,
 )
 
 
@@ -67,6 +67,60 @@ def test_risk_scorer_scores_one_vector_as_an_int():
     scorer = RiskScorer({"model": model, "feature_columns": FEATURE_COLUMNS, "calibration": cal})
     value = scorer.score_one(preprocess(test[0])[1])
     assert isinstance(value, int) and 0 <= value <= 100
+
+
+# ---------- envelope: readings far outside their normal range ----------
+def _scorer_with_envelope():
+    train, _ = generate(n_normal=4000, n_test_normal=10, n_test_attack=3, seed=1)
+    X = pd.DataFrame([preprocess(r)[1] for r in train], columns=FEATURE_COLUMNS)
+    model = IsolationForest(n_estimators=100, random_state=1).fit(X.iloc[:3200])
+    cal = fit_calibration(-model.score_samples(X.iloc[3200:]))
+    return RiskScorer({"model": model, "feature_columns": FEATURE_COLUMNS, "calibration": cal,
+                       "envelope": fit_envelope(X)}), train
+
+
+def _pump(train, **over):
+    r = dict(next(t for t in train if t["device_type"] == "infusion_pump"))
+    r.update(over)
+    return preprocess(r)[1]
+
+
+def test_envelope_flags_a_reading_far_outside_its_range_and_says_which():
+    scorer, train = _scorer_with_envelope()
+    detail = scorer.score_detail(_pump(train, infusion_rate_ml_per_hr=900.0))
+    assert detail["risk"] >= ALERT_THRESHOLD
+    assert detail["reasons"] and detail["reasons"][0].startswith("infusion_rate_ml_per_hr = 900")
+    assert "normal" in detail["reasons"][0]
+
+
+def test_envelope_risk_grows_with_distance_and_caps_at_100():
+    scorer, train = _scorer_with_envelope()
+    near = scorer.score_detail(_pump(train, infusion_rate_ml_per_hr=160.0))["envelope_risk"]
+    far = scorer.score_detail(_pump(train, infusion_rate_ml_per_hr=400.0))["envelope_risk"]
+    huge = scorer.score_detail(_pump(train, infusion_rate_ml_per_hr=1e6))["envelope_risk"]
+    assert ALERT_THRESHOLD <= near < far <= huge == 100.0
+
+
+def test_envelope_ignores_a_reading_inside_its_range():
+    scorer, train = _scorer_with_envelope()
+    detail = scorer.score_detail(_pump(train, infusion_rate_ml_per_hr=100.0, occlusion_pressure_mmHg=40.0,
+                                       battery_pct=60.0, packet_size_bytes=400, request_rate_per_min=12))
+    assert detail["envelope_risk"] == 0.0
+
+
+def test_each_device_type_has_its_own_range():
+    # 150 mL/hr is nothing for a pump but it is not a field a cardiac monitor reports at all
+    scorer, train = _scorer_with_envelope()
+    monitor = dict(next(t for t in train if t["device_type"] == "cardiac_monitor"))
+    assert "infusion_rate_ml_per_hr" not in scorer.envelope["is_cardiac_monitor"]
+    assert scorer.score_detail(preprocess(monitor)[1])["envelope_risk"] == 0.0
+
+
+def test_a_model_file_without_an_envelope_still_works():
+    model, cal, test = _small_model()
+    scorer = RiskScorer({"model": model, "feature_columns": FEATURE_COLUMNS, "calibration": cal})
+    detail = scorer.score_detail(preprocess(test[0])[1])
+    assert detail["envelope_risk"] == 0.0 and 0 <= detail["risk"] <= 100
 
 
 if __name__ == "__main__":

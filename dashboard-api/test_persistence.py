@@ -89,6 +89,17 @@ with TestClient(main.app) as c:
     nurse = c.post("/api/login", json={"username": "nurse.ben", "password": "nurse123"}).json()["token"]
     assert c.get("/api/devices", headers=H(nurse)).json() == []
 
+# ---- the model's explanation survives a restart too ----
+why = ["infusion_rate_ml_per_hr = 400 (normal 20 to 150)"]
+with TestClient(main.app) as c:
+    c.portal.call(main.process, dict(base, message_id="m6", device_id="infusion-pump-002", risk_score=95,
+                                     vulnerability_flags=[], risk_reasons=why))
+forget_everything()
+with TestClient(main.app) as c:
+    admin = c.post("/api/login", json={"username": "admin", "password": "admin123"}).json()["token"]
+    restored = next(a for a in c.get("/api/alerts", headers=H(admin)).json() if a["device_id"] == "infusion-pump-002")
+    assert restored["explanations"] == why and "high_risk_score" in restored["reasons"]
+
 # ---- a database failure mid-run must not stop monitoring ----
 with TestClient(main.app) as c:
     main.db.close()

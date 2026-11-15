@@ -129,4 +129,16 @@ with TestClient(main.app) as c:
     c.portal.call(main.apply_action, {"device_id": "x", "isolated": "yes"})   # malformed commands are ignored
     assert "x" not in main.isolated
     os.environ["DISABLE_KAFKA"] = "1"
+# ---- the model's explanation reaches the alert and the device ----
+with TestClient(main.app) as c:
+    A = login(c, "admin", "admin123").json()["token"]
+    why = ["infusion_rate_ml_per_hr = 400 (normal 20 to 150)"]
+    c.portal.call(main.process, dict(base, message_id="e1", device_id="infusion-pump-099", risk_score=95, risk_reasons=why))
+    a = main.alerts[0]
+    assert a["device_id"] == "infusion-pump-099" and "high_risk_score" in a["reasons"] and a["explanations"] == why
+    dev = next(d for d in c.get("/api/devices", headers=hdr(A)).json() if d["device_id"] == "infusion-pump-099")
+    assert dev["risk_reasons"] == why
+    c.portal.call(main.process, dict(base, message_id="e2", device_id="infusion-pump-098", risk_score=10, risk_reasons=why))
+    assert main.devices["infusion-pump-098"]["risk_reasons"] == why      # kept on the device...
+    assert not [x for x in main.alerts if x["device_id"] == "infusion-pump-098"]   # ...but a low score raises no alert
 print("all dashboard-api checks passed")

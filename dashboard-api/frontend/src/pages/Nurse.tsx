@@ -2,7 +2,7 @@ import { useState } from "react";
 import { api } from "../api";
 import { TopBar } from "../components/parts";
 import { useToast } from "../components/toasts";
-import { ago, plain, readings } from "../format";
+import { ago, explain, plain, readings } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
 import type { Alert, Device, User } from "../types";
 
@@ -39,6 +39,7 @@ function AlertCard({ a }: { a: Alert }) {
         <span className="sub">{ago(a.at)}</span>
       </div>
       <ul style={{ margin: 0, paddingLeft: 18 }}>{a.reasons.map((r) => <li key={r}>{plain(r)}</li>)}</ul>
+      {a.explanations?.map((e) => <div key={e} className="sub">Why flagged: {explain(e)}</div>)}
       {a.tips.map((t) => <div key={t} className="sub">What to do: {t}</div>)}
       {a.ack
         ? <div className="sub">Acknowledged by {a.ack.by} {ago(a.ack.at)}</div>

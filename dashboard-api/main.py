@@ -112,6 +112,7 @@ def summarize(rec: dict) -> dict:
         "patient_id": rec.get("patient_id"),
         "unit": rec.get("unit"),
         "risk_score": rec.get("risk_score", 0),
+        "risk_reasons": rec.get("risk_reasons", []),   # which readings made the model score this high
         "model_version": rec.get("model_version"),
         "flags": rec.get("vulnerability_flags", []),
         "tips": rec.get("remediation_tips", []),
@@ -148,6 +149,7 @@ def maybe_alert(state: dict) -> dict | None:
         "reasons": reasons,
         "severity": "high" if HIGH_SEVERITY_REASONS & set(reasons) else "medium",
         "risk_score": state["risk_score"],
+        "explanations": state["risk_reasons"] if state["risk_score"] >= RISK_ALERT_THRESHOLD else [],
         "tips": state["tips"],
         "at": state["last_seen"] or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "ack": None,   # becomes {"by": username, "at": time} when acknowledged

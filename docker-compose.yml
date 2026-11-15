@@ -113,6 +113,9 @@ services:
       KAFKA_BOOTSTRAP_SERVERS_HOST: ${KAFKA_BOOTSTRAP_SERVERS_INTERNAL:-kafka:9092}
       TOPIC_TELEMETRY_RAW: ${TOPIC_TELEMETRY_RAW:-iomt.telemetry.raw}
       TOPIC_TELEMETRY_SCORED: ${TOPIC_TELEMETRY_SCORED:-iomt.telemetry.scored}
+      MODEL_PATH: /ml/models/isolation_forest.joblib
+    volumes:
+      - ./ml:/ml:ro   # the trained model and risk_scoring.py; train with the steps in stream/consumer.py
 
   # --- Postgres: device state, alerts (with acknowledgments) and the audit log ---
   db:
