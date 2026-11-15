@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import { Chips, DeviceLabel, RiskCell, TopBar } from "../components/parts";
-import { ago, clock, readings } from "../format";
+import { Chips, DeviceLabel, Peaks, RiskCell, TopBar } from "../components/parts";
+import { ago, clock, explain, readings } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
 import type { Alert, AuditEntry, Device, User } from "../types";
 
@@ -21,6 +21,7 @@ function AlertRow({ a }: { a: Alert }) {
         <span className="sub">{ago(a.at)} · risk {a.risk_score}</span>
       </div>
       <Chips items={a.reasons} />
+      {a.explanations?.map((e) => <div key={e} className="sub">Why: {explain(e)}</div>)}
       <div className="sub">{a.ack ? `Acknowledged by ${a.ack.by} ${ago(a.ack.at)}` : "Not yet acknowledged"}</div>
     </li>
   );
@@ -29,7 +30,7 @@ function AlertRow({ a }: { a: Alert }) {
 function DevicesTable({ devices }: { devices: Device[] }) {
   const [busy, setBusy] = useState("");
   async function toggle(d: Device) {
-    if (!d.isolated && !window.confirm(`Isolate ${d.device_id}? Its traffic should be blocked until restored.`)) return;
+    if (!d.isolated && !window.confirm(`Isolate ${d.device_id}? The gateway will refuse its messages until you restore it.`)) return;
     setBusy(d.device_id);
     try { await api(`/api/devices/${encodeURIComponent(d.device_id)}/${d.isolated ? "restore" : "isolate"}`, { method: "POST" }); }
     catch (e) { window.alert((e as Error).message); }
@@ -43,7 +44,7 @@ function DevicesTable({ devices }: { devices: Device[] }) {
           {devices.map((d) => (
             <tr key={d.device_id} className={d.isolated ? "isolated" : ""}>
               <td><DeviceLabel d={d} /></td>
-              <td><RiskCell d={d} />{d.model_version && <div className="sub mono">{d.model_version}</div>}</td>
+              <td><RiskCell d={d} /><Peaks d={d} />{d.model_version && <div className="sub mono">{d.model_version}</div>}</td>
               <td>{d.flags.length ? <Chips items={d.flags} /> : <span className="sub">none</span>}</td>
               <td className="sub">{readings(d.vitals)}</td>
               <td className="sub">{ago(d.last_seen)}</td>
@@ -158,7 +159,7 @@ export default function Admin({ user }: { user: User }) {
           <section role="tabpanel" className="panel">
             <h2>All devices</h2>
             <DevicesTable devices={devices} />
-            <p className="note">Isolating a device is recorded and audited here. Enforcement at the gateway is not connected yet.</p>
+            <p className="note">Isolating a device makes the gateway refuse its messages (HTTP 403) until you restore it. Every command is audited.</p>
           </section>
         )}
 

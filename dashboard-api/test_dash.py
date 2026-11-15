@@ -1,5 +1,6 @@
 import os, sys
 os.environ["DISABLE_KAFKA"] = "1"
+os.environ["DATABASE_URL"] = ""   # these tests are in-memory only; never touch a real database
 sys.path.insert(0, "dashboard-api")
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -101,4 +102,64 @@ with TestClient(main.app) as c:
     assert c.get("/api/me", headers=hdr(N)).status_code == 401
     devs = c.get("/api/devices", headers=hdr(A)).json()
     assert [d["device_id"] for d in devs] == ["cardiac-monitor-001", "infusion-pump-001"], devs
+
+# ---- isolation goes through the actions topic ----
+sent = []
+with TestClient(main.app) as c:
+    A = login(c, "admin", "admin123").json()["token"]
+    c.portal.call(main.process, dict(base, message_id="z1", device_id="infusion-pump-002"))
+    os.environ["DISABLE_KAFKA"] = "0"               # exercise the Kafka path with a fake publisher
+    main.publish_action = lambda ev: sent.append(ev)
+    assert c.post("/api/devices/infusion-pump-002/isolate", headers=hdr(A)).status_code == 200
+    assert sent[0]["device_id"] == "infusion-pump-002" and sent[0]["isolated"] is True and sent[0]["by"] == "admin"
+    assert not main.isolated.get("infusion-pump-002")            # nothing changes until the command is read back
+    c.portal.call(main.apply_action, sent[0])
+    assert main.isolated["infusion-pump-002"] is True and main.devices["infusion-pump-002"]["isolated"] is True
+
+    def boom(ev): raise RuntimeError("kafka down")
+    main.publish_action = boom
+    assert c.post("/api/devices/infusion-pump-002/restore", headers=hdr(A)).status_code == 503
+    assert main.isolated["infusion-pump-002"] is True            # a failed command changes nothing
+    assert "isolation_failed" in [e["action"] for e in c.get("/api/audit", headers=hdr(A)).json()]
+
+    # a command for a device we have not seen yet is remembered and applied when it appears
+    c.portal.call(main.apply_action, {"device_id": "cardiac-monitor-002", "isolated": True})
+    c.portal.call(main.process, dict(base, message_id="z2", device_id="cardiac-monitor-002", device_type="cardiac_monitor"))
+    assert main.devices["cardiac-monitor-002"]["isolated"] is True
+    c.portal.call(main.apply_action, {"device_id": "x", "isolated": "yes"})   # malformed commands are ignored
+    assert "x" not in main.isolated
+    os.environ["DISABLE_KAFKA"] = "1"
+# ---- the model's explanation reaches the alert and the device ----
+with TestClient(main.app) as c:
+    A = login(c, "admin", "admin123").json()["token"]
+    why = ["infusion_rate_ml_per_hr = 400 (normal 20 to 150)"]
+    c.portal.call(main.process, dict(base, message_id="e1", device_id="infusion-pump-099", risk_score=95, risk_reasons=why))
+    a = main.alerts[0]
+    assert a["device_id"] == "infusion-pump-099" and "high_risk_score" in a["reasons"] and a["explanations"] == why
+    dev = next(d for d in c.get("/api/devices", headers=hdr(A)).json() if d["device_id"] == "infusion-pump-099")
+    assert dev["risk_reasons"] == why
+    c.portal.call(main.process, dict(base, message_id="e2", device_id="infusion-pump-098", risk_score=10, risk_reasons=why))
+    assert main.devices["infusion-pump-098"]["risk_reasons"] == why      # kept on the device...
+    assert not [x for x in main.alerts if x["device_id"] == "infusion-pump-098"]   # ...but a low score raises no alert
+# ---- recent peaks: the three highest scores in the window stay visible ----
+with TestClient(main.app) as c:
+    def at(sec): return f"2026-11-14T10:{sec // 60:02d}:{sec % 60:02d}Z"
+    def send(i, score, sec):
+        c.portal.call(main.process, dict(base, message_id=f"p{i}", device_id="infusion-pump-097", risk_score=score,
+                                         ingested_at=at(sec), risk_reasons=[f"battery_pct = {score} (normal 40 to 100)"]))
+        return main.devices["infusion-pump-097"]
+    for i, score in enumerate([100, 20, 85, 90, 15, 100]):          # one message every 30 s
+        d = send(i, score, i * 30)
+    assert d["risk_score"] == 100 and d["peak_window_s"] == main.PEAK_WINDOW_S
+    assert [p["score"] for p in d["recent_peaks"]] == [100, 100, 90]  # top three; 20 and 15 are never recorded
+    assert d["recent_peaks"][0]["at"] == at(150)                       # newest first on a tie
+    assert d["recent_peaks"][0]["reasons"] == ["battery_pct = 100 (normal 40 to 100)"]
+    d = send(6, 5, 160)                                                # a quiet message does not erase them
+    assert d["risk_score"] == 5 and [p["score"] for p in d["recent_peaks"]] == [100, 100, 90]
+    d = send(7, 50, 700)                                               # 11+ minutes on: older peaks age out
+    assert [p["score"] for p in d["recent_peaks"]] == [100, 50] and d["recent_peaks"][0]["at"] == at(150)
+    d = send(8, 30, 800)                                               # a message 650 s after the 100 at 150 s drops it
+    assert [p["score"] for p in d["recent_peaks"]] == [50]
+    got = next(x for x in c.get("/api/devices", headers=hdr(A)).json() if x["device_id"] == "infusion-pump-097")
+    assert got["recent_peaks"] == d["recent_peaks"]
 print("all dashboard-api checks passed")

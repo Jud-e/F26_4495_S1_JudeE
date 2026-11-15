@@ -35,6 +35,14 @@ audit: deque = deque(maxlen=1000)    # newest first
 _audit_seq = 0
 
 
+def restore_audit(entries: list[dict], max_id: int) -> None:
+    """Reload saved audit entries (newest first) after a restart and continue the numbering."""
+    global _audit_seq
+    audit.clear()
+    audit.extend(entries)
+    _audit_seq = max(_audit_seq, max_id)
+
+
 def public(username: str) -> dict:
     u = USERS[username]
     return {"username": username, "name": u["name"], "role": u["role"], "devices": u["devices"]}

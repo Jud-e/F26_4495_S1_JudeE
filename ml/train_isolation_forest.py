@@ -7,7 +7,9 @@ Train the telemetry Isolation Forest on NORMAL messages only.
 --input  .jsonl of normal telemetry (one raw gateway message per line)
 --test   optional .jsonl with _label (0 normal / 1 attack) and _attack, for evaluation
 
-Saves ml/models/isolation_forest.joblib = {model, feature_columns, calibration}.
+Saves ml/models/isolation_forest.joblib = {model, feature_columns, calibration, envelope}.
+The envelope (normal range of each reading per device type) is learned from the same normal data;
+see risk_scoring.py for why the forest alone is not enough.
 Uses the SAME preprocess() as the live consumer, so training and scoring match.
 """
 import argparse
@@ -26,7 +28,7 @@ sys.path.insert(0, str(HERE.parent / "stream"))
 sys.path.insert(0, str(HERE))
 
 from preprocessing import FEATURE_COLUMNS, PreprocessingError, preprocess  # noqa: E402
-from risk_scoring import ALERT_THRESHOLD, fit_calibration, scores_to_risk  # noqa: E402
+from risk_scoring import ALERT_THRESHOLD, RiskScorer, fit_calibration, fit_envelope, scores_to_risk  # noqa: E402
 
 DEFAULT_OUT = HERE / "models" / "isolation_forest.joblib"
 
@@ -70,7 +72,9 @@ def main():
     calibration = fit_calibration(-model.score_samples(cal))
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": model, "feature_columns": FEATURE_COLUMNS, "calibration": calibration}, args.out)
+    envelope = fit_envelope(X)
+    joblib.dump({"model": model, "feature_columns": FEATURE_COLUMNS, "calibration": calibration,
+                 "envelope": envelope}, args.out)
     print(f"Saved model to {args.out}")
 
     if args.test:
@@ -78,18 +82,20 @@ def main():
         y = np.array([r["_label"] for r in recs])
         attack = np.array([r.get("_attack", "?") for r in recs])
         anomaly = -model.score_samples(Xt)
-        flagged = scores_to_risk(anomaly, calibration) >= ALERT_THRESHOLD
-        p, r_, f1, _ = precision_recall_fscore_support(y, flagged, average="binary", zero_division=0)
-        fp, tn = int((flagged & (y == 0)).sum()), int((~flagged & (y == 0)).sum())
+        forest_risk = scores_to_risk(anomaly, calibration)
+        scorer = RiskScorer.load(args.out)
+        final_risk = np.array([scorer.score_one(row) for row in Xt.itertuples(index=False)])
         print(f"\n=== Evaluation (alert threshold: risk >= {ALERT_THRESHOLD}) ===")
-        print(f"ROC AUC                    {roc_auc_score(y, anomaly):.3f}")
-        print(f"Precision / Recall / F1    {p:.3f} / {r_:.3f} / {f1:.3f}")
-        print(f"False-alarm rate           {fp / max(fp + tn, 1):.2%}")
-        print("Recall by attack type:")
-        for a in sorted(set(attack[y == 1])):
-            print(f"  {a:10s} {flagged[(attack == a) & (y == 1)].mean():.3f}")
-        print("Recall by device type is worth checking too: a shared model is weakest on cardiac monitors.")
-
+        print(f"Forest ROC AUC             {roc_auc_score(y, anomaly):.3f}")
+        for name, risk in (("forest only", forest_risk), ("forest + envelope", final_risk)):
+            flagged = risk >= ALERT_THRESHOLD
+            p, r_, f1, _ = precision_recall_fscore_support(y, flagged, average="binary", zero_division=0)
+            fp, tn = int((flagged & (y == 0)).sum()), int((~flagged & (y == 0)).sum())
+            print(f"\n[{name}]")
+            print(f"  Precision / Recall / F1  {p:.3f} / {r_:.3f} / {f1:.3f}")
+            print(f"  False-alarm rate         {fp / max(fp + tn, 1):.2%}")
+            print("  Recall by attack type:   " + ", ".join(
+                f"{a} {flagged[(attack == a) & (y == 1)].mean():.3f}" for a in sorted(set(attack[y == 1]))))
 
 if __name__ == "__main__":
     main()

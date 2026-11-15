@@ -32,6 +32,20 @@ services:
       timeout: 5s
       retries: 5
 
+  # One-shot job: creates the isolation commands topic as a COMPACTED topic, so Kafka keeps the
+  # latest command per device forever and the gateway can rebuild its isolated-device list after a restart.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    command: >
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists
+      --topic ${TOPIC_ACTIONS:-iomt.actions} --partitions 1 --replication-factor 1
+      --config cleanup.policy=compact
+
   # Optional but very useful while developing: a GUI to see topics/messages
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -50,13 +64,15 @@ services:
       context: ./gateway
     container_name: gateway
     depends_on:
-      - kafka
+      kafka-init:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS_INTERNAL:-kafka:9092}
       TOPIC_TELEMETRY_RAW: ${TOPIC_TELEMETRY_RAW:-iomt.telemetry.raw}
       GATEWAY_API_TOKEN: ${GATEWAY_API_TOKEN:-dev-shared-secret-change-me}
+      TOPIC_ACTIONS: ${TOPIC_ACTIONS:-iomt.actions}
     volumes:
       - ./gateway:/app   # live code reload while developing
       - ./data:/app/data:ro   # patient registry (read-only — gateway doesn't modify it)
@@ -68,13 +84,18 @@ services:
       context: ./dashboard-api
     container_name: dashboard-api
     depends_on:
-      - kafka
+      kafka-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
     ports:
       - "8100:8100"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS_INTERNAL:-kafka:9092}
       TOPIC_TELEMETRY_SCORED: ${TOPIC_TELEMETRY_SCORED:-iomt.telemetry.scored}
+      TOPIC_ACTIONS: ${TOPIC_ACTIONS:-iomt.actions}
       RISK_ALERT_THRESHOLD: ${RISK_ALERT_THRESHOLD:-70}
+      DATABASE_URL: postgresql://medguard:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@db:5432/medguard
     volumes:
       - ./dashboard-api:/app   # live code reload while developing
     command: uvicorn main:app --host 0.0.0.0 --port 8100 --reload
@@ -92,19 +113,28 @@ services:
       KAFKA_BOOTSTRAP_SERVERS_HOST: ${KAFKA_BOOTSTRAP_SERVERS_INTERNAL:-kafka:9092}
       TOPIC_TELEMETRY_RAW: ${TOPIC_TELEMETRY_RAW:-iomt.telemetry.raw}
       TOPIC_TELEMETRY_SCORED: ${TOPIC_TELEMETRY_SCORED:-iomt.telemetry.scored}
+      MODEL_PATH: /ml/models/isolation_forest.joblib
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./ml:/ml:ro   # the trained model and risk_scoring.py; train with the steps in stream/consumer.py
 
-  # --- Postgres for storing device metadata / risk scores ---
+  # --- Postgres: device state, alerts (with acknowledgments) and the audit log ---
   db:
     image: postgres:16-alpine
     container_name: iomt-db
     environment:
       POSTGRES_USER: medguard
-      POSTGRES_PASSWORD: medguard_dev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: medguard
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medguard -d medguard"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pgdata:

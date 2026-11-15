@@ -4,8 +4,10 @@ Consumes raw telemetry from Kafka, preprocesses it, scores it, and publishes the
 Run locally (outside Docker) against the host-exposed Kafka port:
     python stream/consumer.py
 
-Scoring needs a trained model. Create one first:
-    python ml/train_isolation_forest.py --input <normal telemetry .jsonl>
+Scoring needs a trained model. Create one first (the simulator's own normal traffic works well):
+    python ml/make_simulator_data.py
+    python ml/train_isolation_forest.py --input ml/data/simulator/train_normal.jsonl
+In Docker the ml/ folder is mounted at /ml, so the model is read from /ml/models/.
 Without a model file the consumer still runs, but every risk_score is 0
 (so a 0 on the dashboard can mean "no model", not "safe").
 """
@@ -72,15 +74,18 @@ def main():
             print(f"Skipping unusable record: {exc}")
             continue
 
-        # Model inference: feature vector -> risk score 0-100.
-        risk_score = scorer.score_one(features) if scorer else 0
+        # Model inference: feature vector -> risk score 0-100, plus which readings caused it.
+        detail = scorer.score_detail(features) if scorer else {"risk": 0, "reasons": []}
+        risk_score = detail["risk"]
 
         # Keep the original record (vulnerability flags, remediation tips...) and attach what we computed.
         scored = dict(record)
         scored["features"] = dict(zip(FEATURE_COLUMNS, features))
         scored["risk_score"] = risk_score
+        scored["risk_reasons"] = detail["reasons"]   # e.g. "request_rate_per_min = 450 (normal 1 to 6)"
         producer.send(TOPIC_OUT, scored)
-        print(f"Scored {meta['device_id']} ({meta['device_type']}): risk_score={risk_score}")
+        why = f"  <- {'; '.join(detail['reasons'])}" if detail["reasons"] else ""
+        print(f"Scored {meta['device_id']} ({meta['device_type']}): risk_score={risk_score}{why}")
 
 
 if __name__ == "__main__":

@@ -497,3 +497,9 @@ label.f {
   gap: 10px;
   font-weight: 500;
 }
+
+/* recent risk peaks under a device */
+.peaks { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.peak { font: 12px/1 ui-monospace, monospace; padding: 3px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.peak.high { color: var(--crit); background: var(--crit-bg); border-color: transparent; }
+.peak.mid { color: var(--warn); background: var(--warn-bg); border-color: transparent; }

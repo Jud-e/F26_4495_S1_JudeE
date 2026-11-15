@@ -37,3 +37,6 @@ gateway/cert.pem
 
 mkcert.exe
 test_payload.json
+
+# Generated training/test data (rebuild with ml/make_simulator_data.py)
+/ml/data/

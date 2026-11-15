@@ -218,6 +218,8 @@ def main():
                 outcome = "ACCEPTED"
             elif status_code in (401, 422):
                 outcome = f"REJECTED({status_code})"
+            elif status_code == 403:
+                outcome = "BLOCKED(403)"      # the device was isolated by an administrator
             elif status_code is None:
                 outcome = "CONN-ERROR"
             else:

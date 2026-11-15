@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { api } from "../api";
-import { TopBar } from "../components/parts";
-import { useToast } from "../components/Toasts";
-import { ago, plain, readings } from "../format";
+import { Peaks, TopBar } from "../components/parts";
+import { useToast } from "../components/toasts";
+import { ago, explain, plain, readings } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
 import type { Alert, Device, User } from "../types";
 
@@ -20,6 +20,7 @@ function DeviceCard({ d, open }: { d: Device; open: Alert[] }) {
       {d.isolated && <div className="sub">This device was isolated by an administrator. Use manual monitoring until it is restored.</div>}
       {d.flags.length > 0 && <ul>{d.flags.map((f) => <li key={f}>{plain(f)}</li>)}</ul>}
       <div className="sub">{readings(d.vitals)}</div>
+      <Peaks d={d} />
       <div className="sub">Last update {ago(d.last_seen)}</div>
     </div>
   );
@@ -39,6 +40,7 @@ function AlertCard({ a }: { a: Alert }) {
         <span className="sub">{ago(a.at)}</span>
       </div>
       <ul style={{ margin: 0, paddingLeft: 18 }}>{a.reasons.map((r) => <li key={r}>{plain(r)}</li>)}</ul>
+      {a.explanations?.map((e) => <div key={e} className="sub">Why flagged: {explain(e)}</div>)}
       {a.tips.map((t) => <div key={t} className="sub">What to do: {t}</div>)}
       {a.ack
         ? <div className="sub">Acknowledged by {a.ack.by} {ago(a.ack.at)}</div>
