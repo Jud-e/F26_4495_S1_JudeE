@@ -1,4 +1,4 @@
-import { CRIT, riskClass } from "../format";
+import { CRIT, ago, explain, riskClass } from "../format";
 import { logout } from "../api";
 import type { Device, User } from "../types";
 
@@ -11,6 +11,23 @@ export function RiskCell({ d }: { d: Device }) {
     <div className="riskcell">
       <div className="bar"><i className={riskClass(d.risk_score)} style={{ width: Math.min(100, d.risk_score) + "%" }} /></div>
       <span className="num">{d.risk_score}</span>
+    </div>
+  );
+}
+
+/** A device's highest recent risk scores, so a spike stays visible after quieter messages replace the current score. */
+export function Peaks({ d }: { d: Device }) {
+  const windowMs = (d.peak_window_s ?? 600) * 1000;
+  const recent = (d.recent_peaks ?? []).filter((p) => Date.now() - new Date(p.at).getTime() <= windowMs);
+  if (!recent.length) return null;
+  return (
+    <div className="peaks">
+      <span className="sub">Recent peaks</span>
+      {recent.map((p) => (
+        <span key={p.at + p.score} className={"peak " + riskClass(p.score)} title={p.reasons.map(explain).join("; ")}>
+          {p.score} · {ago(p.at)}
+        </span>
+      ))}
     </div>
   );
 }

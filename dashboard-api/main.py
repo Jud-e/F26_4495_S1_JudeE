@@ -27,6 +27,7 @@ Isolation is not stored in Postgres: the actions topic is its single source of t
 Without DATABASE_URL the service runs purely in memory and replays the topic on start.
 """
 import asyncio
+from datetime import datetime
 import json
 import os
 import threading
@@ -49,6 +50,11 @@ TOPIC_SCORED = os.getenv("TOPIC_TELEMETRY_SCORED", "iomt.telemetry.scored")
 # Risk score (0-100) at or above which a device raises a high-risk alert.
 TOPIC_ACTIONS = os.getenv("TOPIC_ACTIONS", "iomt.actions")
 RISK_ALERT_THRESHOLD = int(os.getenv("RISK_ALERT_THRESHOLD", "70"))
+# "Recent peaks": each device keeps its PEAK_COUNT highest scores from the last PEAK_WINDOW_S seconds,
+# so a spike stays visible after later, quieter messages replace the current score.
+PEAK_COUNT = 3
+PEAK_WINDOW_S = int(os.getenv("PEAK_WINDOW_S", "600"))
+PEAK_MIN_SCORE = int(os.getenv("PEAK_MIN_SCORE", "40"))
 MAX_ALERTS = 200
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 CONSUMER_GROUP = os.getenv("DASHBOARD_CONSUMER_GROUP", "medguard-dashboard")
@@ -123,6 +129,30 @@ def summarize(rec: dict) -> dict:
     }
 
 
+def _epoch(iso) -> float | None:
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def update_peaks(previous: list, state: dict) -> list:
+    """Merge this message into the device's recent peaks: highest scores first, newest first on ties.
+
+    Ages are measured against the message's own timestamp, not the wall clock, so replaying old
+    messages after a restart does not make them look recent. The browser hides peaks that have
+    since aged out of the window.
+    """
+    peaks = list(previous)
+    now = _epoch(state["last_seen"])
+    if now is not None and state["risk_score"] >= PEAK_MIN_SCORE:
+        peaks.append({"score": state["risk_score"], "at": state["last_seen"], "reasons": state["risk_reasons"][:2]})
+    if now is not None:
+        peaks = [p for p in peaks if (t := _epoch(p["at"])) is not None and 0 <= now - t <= PEAK_WINDOW_S]
+    peaks.sort(key=lambda p: (-p["score"], -(_epoch(p["at"]) or 0)))
+    return peaks[:PEAK_COUNT]
+
+
 def maybe_alert(state: dict) -> dict | None:
     """Create an alert when a device's set of problems changes.
 
@@ -185,6 +215,8 @@ async def process(rec: dict) -> None:
         return
     state = summarize(rec)
     state["isolated"] = isolated.get(state["device_id"], False)
+    state["recent_peaks"] = update_peaks(devices.get(state["device_id"], {}).get("recent_peaks", []), state)
+    state["peak_window_s"] = PEAK_WINDOW_S
     devices[state["device_id"]] = state
     await persist("save_device", state)
     await broadcast({"type": "device", "device": state}, device_id=state["device_id"])

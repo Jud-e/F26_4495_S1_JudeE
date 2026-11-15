@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api } from "../api";
-import { TopBar } from "../components/parts";
+import { Peaks, TopBar } from "../components/parts";
 import { useToast } from "../components/toasts";
 import { ago, explain, plain, readings } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
@@ -20,6 +20,7 @@ function DeviceCard({ d, open }: { d: Device; open: Alert[] }) {
       {d.isolated && <div className="sub">This device was isolated by an administrator. Use manual monitoring until it is restored.</div>}
       {d.flags.length > 0 && <ul>{d.flags.map((f) => <li key={f}>{plain(f)}</li>)}</ul>}
       <div className="sub">{readings(d.vitals)}</div>
+      <Peaks d={d} />
       <div className="sub">Last update {ago(d.last_seen)}</div>
     </div>
   );

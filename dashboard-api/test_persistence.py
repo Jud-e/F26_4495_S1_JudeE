@@ -99,6 +99,8 @@ with TestClient(main.app) as c:
     admin = c.post("/api/login", json={"username": "admin", "password": "admin123"}).json()["token"]
     restored = next(a for a in c.get("/api/alerts", headers=H(admin)).json() if a["device_id"] == "infusion-pump-002")
     assert restored["explanations"] == why and "high_risk_score" in restored["reasons"]
+    peaks = main.devices["infusion-pump-002"]["recent_peaks"]          # recent peaks come back with the device
+    assert [p["score"] for p in peaks] == [95] and peaks[0]["reasons"] == why
 
 # ---- a database failure mid-run must not stop monitoring ----
 with TestClient(main.app) as c:

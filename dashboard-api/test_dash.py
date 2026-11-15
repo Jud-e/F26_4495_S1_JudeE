@@ -141,4 +141,25 @@ with TestClient(main.app) as c:
     c.portal.call(main.process, dict(base, message_id="e2", device_id="infusion-pump-098", risk_score=10, risk_reasons=why))
     assert main.devices["infusion-pump-098"]["risk_reasons"] == why      # kept on the device...
     assert not [x for x in main.alerts if x["device_id"] == "infusion-pump-098"]   # ...but a low score raises no alert
+# ---- recent peaks: the three highest scores in the window stay visible ----
+with TestClient(main.app) as c:
+    def at(sec): return f"2026-11-14T10:{sec // 60:02d}:{sec % 60:02d}Z"
+    def send(i, score, sec):
+        c.portal.call(main.process, dict(base, message_id=f"p{i}", device_id="infusion-pump-097", risk_score=score,
+                                         ingested_at=at(sec), risk_reasons=[f"battery_pct = {score} (normal 40 to 100)"]))
+        return main.devices["infusion-pump-097"]
+    for i, score in enumerate([100, 20, 85, 90, 15, 100]):          # one message every 30 s
+        d = send(i, score, i * 30)
+    assert d["risk_score"] == 100 and d["peak_window_s"] == main.PEAK_WINDOW_S
+    assert [p["score"] for p in d["recent_peaks"]] == [100, 100, 90]  # top three; 20 and 15 are never recorded
+    assert d["recent_peaks"][0]["at"] == at(150)                       # newest first on a tie
+    assert d["recent_peaks"][0]["reasons"] == ["battery_pct = 100 (normal 40 to 100)"]
+    d = send(6, 5, 160)                                                # a quiet message does not erase them
+    assert d["risk_score"] == 5 and [p["score"] for p in d["recent_peaks"]] == [100, 100, 90]
+    d = send(7, 50, 700)                                               # 11+ minutes on: older peaks age out
+    assert [p["score"] for p in d["recent_peaks"]] == [100, 50] and d["recent_peaks"][0]["at"] == at(150)
+    d = send(8, 30, 800)                                               # a message 650 s after the 100 at 150 s drops it
+    assert [p["score"] for p in d["recent_peaks"]] == [50]
+    got = next(x for x in c.get("/api/devices", headers=hdr(A)).json() if x["device_id"] == "infusion-pump-097")
+    assert got["recent_peaks"] == d["recent_peaks"]
 print("all dashboard-api checks passed")

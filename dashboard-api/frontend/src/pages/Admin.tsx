@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import { Chips, DeviceLabel, RiskCell, TopBar } from "../components/parts";
+import { Chips, DeviceLabel, Peaks, RiskCell, TopBar } from "../components/parts";
 import { ago, clock, explain, readings } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
 import type { Alert, AuditEntry, Device, User } from "../types";
@@ -44,7 +44,7 @@ function DevicesTable({ devices }: { devices: Device[] }) {
           {devices.map((d) => (
             <tr key={d.device_id} className={d.isolated ? "isolated" : ""}>
               <td><DeviceLabel d={d} /></td>
-              <td><RiskCell d={d} />{d.model_version && <div className="sub mono">{d.model_version}</div>}</td>
+              <td><RiskCell d={d} /><Peaks d={d} />{d.model_version && <div className="sub mono">{d.model_version}</div>}</td>
               <td>{d.flags.length ? <Chips items={d.flags} /> : <span className="sub">none</span>}</td>
               <td className="sub">{readings(d.vitals)}</td>
               <td className="sub">{ago(d.last_seen)}</td>
