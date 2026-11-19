@@ -31,6 +31,24 @@ export async function api<T = unknown>(path: string, opts: { method?: string; bo
   return res.json() as Promise<T>;
 }
 
+/** Download a file from an authenticated endpoint (the browser cannot send the Bearer header on a plain link). */
+export async function download(path: string): Promise<void> {
+  const token = getToken();
+  const res = await fetch(path, { headers: token ? { Authorization: "Bearer " + token } : {} });
+  if (res.status === 401) { clearSession(); window.location.replace("/login"); throw new Error("signed out"); }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch { /* not json */ }
+    throw new Error(detail);
+  }
+  const name = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "")?.[1] || "export";
+  const url = URL.createObjectURL(await res.blob());
+  const link = document.createElement("a");
+  link.href = url; link.download = name;
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export async function logout() {
   try { await api("/api/logout", { method: "POST" }); } catch { /* already signed out */ }
   clearSession();

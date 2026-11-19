@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api } from "../api";
-import { Peaks, TopBar } from "../components/parts";
+import { ExportButtons, TopBar } from "../components/parts";
+import RiskChart, { PeriodPicker } from "../components/riskChart";
 import { useToast } from "../components/toasts";
 import { ago, explain, plain, readings } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
@@ -8,7 +9,7 @@ import type { Alert, Device, User } from "../types";
 
 const canPush = typeof Notification !== "undefined";
 
-function DeviceCard({ d, open }: { d: Device; open: Alert[] }) {
+function DeviceCard({ d, open, minutes }: { d: Device; open: Alert[]; minutes: number }) {
   const mine = open.filter((a) => a.device_id === d.device_id);
   const urgent = d.risk_score >= 70 || mine.some((a) => a.severity === "high");
   const state = urgent ? "attn" : mine.length || d.flags.length ? "watch" : "";
@@ -20,7 +21,7 @@ function DeviceCard({ d, open }: { d: Device; open: Alert[] }) {
       {d.isolated && <div className="sub">This device was isolated by an administrator. Use manual monitoring until it is restored.</div>}
       {d.flags.length > 0 && <ul>{d.flags.map((f) => <li key={f}>{plain(f)}</li>)}</ul>}
       <div className="sub">{readings(d.vitals)}</div>
-      <Peaks d={d} />
+      <RiskChart deviceId={d.device_id} minutes={minutes} />
       <div className="sub">Last update {ago(d.last_seen)}</div>
     </div>
   );
@@ -52,6 +53,7 @@ function AlertCard({ a }: { a: Alert }) {
 export default function Nurse({ user }: { user: User }) {
   useTick();
   const toast = useToast();
+  const [minutes, setMinutes] = useState(60);
   const [perm, setPerm] = useState<string>(canPush ? Notification.permission : "unsupported");
 
   const { devices, alerts, connected } = useLive((a) => {
@@ -90,7 +92,8 @@ export default function Nurse({ user }: { user: User }) {
 
         <section>
           <h2>My devices {devices.length > 0 && <span className="note">({devices.length})</span>}</h2>
-          <div className="cards">{devices.map((d) => <DeviceCard key={d.device_id} d={d} open={open} />)}</div>
+          <div className="toolbar"><PeriodPicker minutes={minutes} onChange={setMinutes} /><span className="sub">Risk score over time (0 to 100). Dashed line: alert level.</span></div>
+          <div className="cards">{devices.map((d) => <DeviceCard key={d.device_id} d={d} open={open} minutes={minutes} />)}</div>
           {devices.length === 0 && <div className="empty">No device data yet for your assigned devices.</div>}
         </section>
 
@@ -101,7 +104,7 @@ export default function Nurse({ user }: { user: User }) {
         </section>
 
         <section className="panel">
-          <h2>Acknowledged</h2>
+          <div className="toolbar"><h2 style={{ margin: 0 }}>Acknowledged</h2><ExportButtons path="/api/alerts/export" label="Export my alerts" /></div>
           <ul className="alerts" id="done">{done.slice(0, 20).map((a) => <AlertCard key={a.id} a={a} />)}</ul>
           {done.length === 0 && <div className="empty">No acknowledged alerts yet.</div>}
         </section>

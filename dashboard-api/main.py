@@ -27,6 +27,8 @@ Isolation is not stored in Postgres: the actions topic is its single source of t
 Without DATABASE_URL the service runs purely in memory and replays the topic on start.
 """
 import asyncio
+import csv
+import io
 from datetime import datetime
 import json
 import os
@@ -50,11 +52,10 @@ TOPIC_SCORED = os.getenv("TOPIC_TELEMETRY_SCORED", "iomt.telemetry.scored")
 # Risk score (0-100) at or above which a device raises a high-risk alert.
 TOPIC_ACTIONS = os.getenv("TOPIC_ACTIONS", "iomt.actions")
 RISK_ALERT_THRESHOLD = int(os.getenv("RISK_ALERT_THRESHOLD", "70"))
-# "Recent peaks": each device keeps its PEAK_COUNT highest scores from the last PEAK_WINDOW_S seconds,
-# so a spike stays visible after later, quieter messages replace the current score.
-PEAK_COUNT = 3
-PEAK_WINDOW_S = int(os.getenv("PEAK_WINDOW_S", "600"))
-PEAK_MIN_SCORE = int(os.getenv("PEAK_MIN_SCORE", "40"))
+# Risk history: each device keeps the highest score per HISTORY_BUCKET_S slot for HISTORY_HOURS, so the
+# dashboard can draw risk-over-time charts that survive a restart (stored in Postgres when it is on).
+HISTORY_BUCKET_S = 10
+HISTORY_HOURS = int(os.getenv("HISTORY_HOURS", "24"))
 MAX_ALERTS = 200
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 CONSUMER_GROUP = os.getenv("DASHBOARD_CONSUMER_GROUP", "medguard-dashboard")
@@ -74,6 +75,7 @@ _signatures: dict[str, str] = {}   # last alert reason set per device, to avoid 
 _alert_seq = 0
 isolated: dict[str, bool] = {}     # device_id -> isolated, rebuilt from the actions topic
 kafka_connected = False
+history: dict[str, dict[int, float]] = {}   # device_id -> {bucket start (epoch s) -> highest score in it}
 db: store_module.Store | None = None   # set in the lifespan when DATABASE_URL is configured
 
 
@@ -103,6 +105,8 @@ def restore_from_db() -> None:
         d["isolated"] = isolated.get(d["device_id"], False)
         devices[d["device_id"]] = d
         _signatures[d["device_id"]] = signature_for(d)   # so a restart does not re-alert on unchanged problems
+    for device_id, bucket, score in db.load_history(int(time.time()) - HISTORY_HOURS * 3600):
+        history.setdefault(device_id, {})[bucket] = score
     alerts.clear()
     alerts.extend(data["alerts"])                          # newest first, as stored
     _alert_seq = max(_alert_seq, data["max_alert_id"])
@@ -136,21 +140,37 @@ def _epoch(iso) -> float | None:
         return None
 
 
-def update_peaks(previous: list, state: dict) -> list:
-    """Merge this message into the device's recent peaks: highest scores first, newest first on ties.
+def record_history(device_id: str, last_seen, score: float) -> tuple[int, float] | None:
+    """Fold one score into the device's history. Returns (bucket, score) when the stored value changed, else None.
 
-    Ages are measured against the message's own timestamp, not the wall clock, so replaying old
-    messages after a restart does not make them look recent. The browser hides peaks that have
-    since aged out of the window.
+    Slots come from the message's own timestamp, so replayed old messages land where they belong.
     """
-    peaks = list(previous)
-    now = _epoch(state["last_seen"])
-    if now is not None and state["risk_score"] >= PEAK_MIN_SCORE:
-        peaks.append({"score": state["risk_score"], "at": state["last_seen"], "reasons": state["risk_reasons"][:2]})
-    if now is not None:
-        peaks = [p for p in peaks if (t := _epoch(p["at"])) is not None and 0 <= now - t <= PEAK_WINDOW_S]
-    peaks.sort(key=lambda p: (-p["score"], -(_epoch(p["at"]) or 0)))
-    return peaks[:PEAK_COUNT]
+    t = _epoch(last_seen)
+    if t is None:
+        return None
+    bucket = int(t // HISTORY_BUCKET_S) * HISTORY_BUCKET_S
+    slots = history.setdefault(device_id, {})
+    if bucket in slots and slots[bucket] >= score:
+        return None
+    slots[bucket] = score
+    cutoff = bucket - HISTORY_HOURS * 3600
+    for old in [b for b in slots if b < cutoff]:
+        del slots[old]
+    return bucket, score
+
+
+def history_points(device_id: str, minutes: int) -> dict:
+    """Points for one device over the last `minutes`, thinned to at most ~120 by keeping the highest score per slot."""
+    now = time.time()
+    start = now - minutes * 60
+    width = max(HISTORY_BUCKET_S, (minutes * 60 // 120 // HISTORY_BUCKET_S) * HISTORY_BUCKET_S)
+    merged: dict[int, float] = {}
+    for bucket, score in history.get(device_id, {}).items():
+        if bucket >= start - HISTORY_BUCKET_S:
+            slot = int(bucket // width) * width
+            merged[slot] = max(merged.get(slot, 0), score)
+    return {"device_id": device_id, "minutes": minutes, "bucket_s": width, "from": int(start), "to": int(now),
+            "points": [{"t": b, "score": merged[b]} for b in sorted(merged)]}
 
 
 def maybe_alert(state: dict) -> dict | None:
@@ -215,10 +235,11 @@ async def process(rec: dict) -> None:
         return
     state = summarize(rec)
     state["isolated"] = isolated.get(state["device_id"], False)
-    state["recent_peaks"] = update_peaks(devices.get(state["device_id"], {}).get("recent_peaks", []), state)
-    state["peak_window_s"] = PEAK_WINDOW_S
     devices[state["device_id"]] = state
     await persist("save_device", state)
+    changed = record_history(state["device_id"], state["last_seen"], state["risk_score"])
+    if changed:
+        await persist("save_history", state["device_id"], *changed)
     await broadcast({"type": "device", "device": state}, device_id=state["device_id"])
     alert = maybe_alert(state)
     if alert:
@@ -324,6 +345,7 @@ async def lifespan(app: FastAPI):
         if await asyncio.to_thread(candidate.connect, int(os.getenv("DB_CONNECT_ATTEMPTS", "15"))):
             db = candidate
             await asyncio.to_thread(restore_from_db)
+            await asyncio.to_thread(db.prune_history, int(time.time()) - HISTORY_HOURS * 3600)
         else:
             print("dashboard-api: could not reach the database; running in memory only")
     if os.getenv("DISABLE_KAFKA") != "1":
@@ -467,6 +489,72 @@ async def restore(device_id: str, user: dict = Depends(auth.require_admin)):
 @app.get("/api/audit")
 def get_audit(user: dict = Depends(auth.require_admin)):
     return list(auth.audit)
+
+
+# ---------- exports ----------
+def _cell(v) -> str:
+    """One CSV cell. Text starting with = + - @ would run as a formula when opened in Excel, so it is prefixed with '."""
+    s = "" if v is None else (json.dumps(v) if isinstance(v, (list, dict)) else str(v))
+    return ("'" + s) if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
+
+def export_response(rows: list[dict], columns: list[str], fmt: str, name: str) -> Response:
+    if fmt not in ("csv", "json"):
+        raise HTTPException(status_code=400, detail="format must be csv or json")
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    headers = {"Content-Disposition": f'attachment; filename="{name}-{stamp}.{fmt}"', "Cache-Control": "no-store"}
+    if fmt == "json":
+        return Response(json.dumps(rows, indent=2), media_type="application/json", headers=headers)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(columns)
+    for r in rows:
+        w.writerow([_cell(r.get(c)) for c in columns])
+    return Response("\ufeff" + out.getvalue(), media_type="text/csv; charset=utf-8", headers=headers)
+
+
+@app.get("/api/audit/export")
+async def export_audit(format: str = "csv", action: str = "", user_filter: str = "", q: str = "", since: str = "",
+                       user: dict = Depends(auth.require_admin)):
+    """Admin only. Exports the full stored audit log (not just the latest entries), oldest first, and audits the export."""
+    if db is not None and db.ready:
+        rows = await asyncio.to_thread(db.audit_rows, action, user_filter, q, since)
+    else:
+        ql = q.lower()
+        rows = [e for e in reversed(auth.audit)
+                if (not action or e["action"] == action) and (not user_filter or e["user"] == user_filter)
+                and (not ql or ql in f'{e["target"]} {e["detail"]} {e["user"]}'.lower()) and (not since or e["at"] >= since)]
+    resp = export_response(rows, ["id", "at", "user", "role", "action", "target", "detail"], format, "medguard-audit")
+    await log(user["username"], user["role"], "audit_exported", "audit_log", f"{len(rows)} entries as {format}")
+    return resp
+
+
+@app.get("/api/alerts/export")
+async def export_alerts(format: str = "csv", user: dict = Depends(auth.current_user)):
+    """Alerts the signed-in user is allowed to see (a nurse gets only their devices), newest first."""
+    rows = [{**a, "acked_by": (a["ack"] or {}).get("by"), "acked_at": (a["ack"] or {}).get("at"),
+             "reasons": "; ".join(a["reasons"]), "explanations": "; ".join(a.get("explanations") or [])}
+            for a in visible_alerts(user)]
+    resp = export_response(rows, ["id", "at", "device_id", "device_type", "unit", "severity", "risk_score", "reasons",
+                                  "explanations", "acked_by", "acked_at"], format, "medguard-alerts")
+    await log(user["username"], user["role"], "alerts_exported", "alerts", f"{len(rows)} alerts as {format}")
+    return resp
+
+
+@app.get("/api/devices/{device_id}/history")
+async def device_history(device_id: str, minutes: int = 60, format: str = "json", user: dict = Depends(auth.current_user)):
+    """Risk score over time for one device. `minutes` is 5 to the retention limit; format=csv downloads it."""
+    if device_id not in devices or not auth.can_see(user, device_id):
+        raise HTTPException(status_code=404, detail="Unknown device")
+    minutes = max(5, min(minutes, HISTORY_HOURS * 60))
+    data = history_points(device_id, minutes)
+    if format == "json":
+        return data
+    rows = [{"device_id": device_id, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(p["t"])), "max_risk_score": p["score"]}
+            for p in data["points"]]
+    resp = export_response(rows, ["device_id", "time", "max_risk_score"], format, f"medguard-risk-{device_id}")
+    await log(user["username"], user["role"], "history_exported", device_id, f"{len(rows)} points, last {minutes} min, as {format}")
+    return resp
 
 
 @app.get("/api/users")

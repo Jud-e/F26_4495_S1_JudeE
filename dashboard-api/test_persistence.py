@@ -44,11 +44,11 @@ def count(table):
 
 def forget_everything():
     """What a process restart does to memory."""
-    main.devices.clear(); main.alerts.clear(); main._signatures.clear(); main._alert_seq = 0
+    main.devices.clear(); main.history.clear(); main.alerts.clear(); main._signatures.clear(); main._alert_seq = 0
     auth.audit.clear(); auth._audit_seq = 0; auth.sessions.clear()
 
 with psycopg.connect(URL, autocommit=True) as c:
-    c.execute("DROP TABLE IF EXISTS devices, alerts, audit_log")
+    c.execute("DROP TABLE IF EXISTS devices, alerts, audit_log, risk_history")
 
 # ---- run 1: normal use writes through to Postgres ----
 main.DATABASE_URL = URL
@@ -99,8 +99,24 @@ with TestClient(main.app) as c:
     admin = c.post("/api/login", json={"username": "admin", "password": "admin123"}).json()["token"]
     restored = next(a for a in c.get("/api/alerts", headers=H(admin)).json() if a["device_id"] == "infusion-pump-002")
     assert restored["explanations"] == why and "high_risk_score" in restored["reasons"]
-    peaks = main.devices["infusion-pump-002"]["recent_peaks"]          # recent peaks come back with the device
-    assert [p["score"] for p in peaks] == [95] and peaks[0]["reasons"] == why
+
+# ---- risk history survives a restart, keeps the highest score per slot, and old rows are pruned ----
+import time as _time
+_now = _time.time()
+_iso = lambda ago: _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_now - ago))
+with TestClient(main.app) as c:
+    for i, (score, ago) in enumerate([(40, 600), (90, 300), (20, 299), (10, 60)]):
+        c.portal.call(main.process, dict(base, message_id=f"hh{i}", device_id="infusion-pump-003", risk_score=score, ingested_at=_iso(ago)))
+    c.portal.call(main.process, dict(base, message_id="hhold", device_id="infusion-pump-003", risk_score=99, ingested_at=_iso(3600 * 30)))
+before = [p["score"] for p in main.history_points("infusion-pump-003", 60)["points"]]
+assert 90 in before and 99 not in before, before
+forget_everything()
+with TestClient(main.app) as c:
+    admin = c.post("/api/login", json={"username": "admin", "password": "admin123"}).json()["token"]
+    after = c.get("/api/devices/infusion-pump-003/history?minutes=60", headers=H(admin)).json()
+    assert [p["score"] for p in after["points"]] == before              # the chart is the same after a restart
+    with psycopg.connect(URL, autocommit=True) as raw:                   # the 30-hour-old row was pruned at startup
+        assert raw.execute("SELECT count(*) FROM risk_history WHERE score = 99").fetchone()[0] == 0
 
 # ---- a database failure mid-run must not stop monitoring ----
 with TestClient(main.app) as c:

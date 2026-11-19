@@ -141,25 +141,52 @@ with TestClient(main.app) as c:
     c.portal.call(main.process, dict(base, message_id="e2", device_id="infusion-pump-098", risk_score=10, risk_reasons=why))
     assert main.devices["infusion-pump-098"]["risk_reasons"] == why      # kept on the device...
     assert not [x for x in main.alerts if x["device_id"] == "infusion-pump-098"]   # ...but a low score raises no alert
-# ---- recent peaks: the three highest scores in the window stay visible ----
+# ---- risk history: charts and exports ----
+import csv as _csv, io as _io, time as _time
 with TestClient(main.app) as c:
-    def at(sec): return f"2026-11-14T10:{sec // 60:02d}:{sec % 60:02d}Z"
-    def send(i, score, sec):
-        c.portal.call(main.process, dict(base, message_id=f"p{i}", device_id="infusion-pump-097", risk_score=score,
-                                         ingested_at=at(sec), risk_reasons=[f"battery_pct = {score} (normal 40 to 100)"]))
-        return main.devices["infusion-pump-097"]
-    for i, score in enumerate([100, 20, 85, 90, 15, 100]):          # one message every 30 s
-        d = send(i, score, i * 30)
-    assert d["risk_score"] == 100 and d["peak_window_s"] == main.PEAK_WINDOW_S
-    assert [p["score"] for p in d["recent_peaks"]] == [100, 100, 90]  # top three; 20 and 15 are never recorded
-    assert d["recent_peaks"][0]["at"] == at(150)                       # newest first on a tie
-    assert d["recent_peaks"][0]["reasons"] == ["battery_pct = 100 (normal 40 to 100)"]
-    d = send(6, 5, 160)                                                # a quiet message does not erase them
-    assert d["risk_score"] == 5 and [p["score"] for p in d["recent_peaks"]] == [100, 100, 90]
-    d = send(7, 50, 700)                                               # 11+ minutes on: older peaks age out
-    assert [p["score"] for p in d["recent_peaks"]] == [100, 50] and d["recent_peaks"][0]["at"] == at(150)
-    d = send(8, 30, 800)                                               # a message 650 s after the 100 at 150 s drops it
-    assert [p["score"] for p in d["recent_peaks"]] == [50]
-    got = next(x for x in c.get("/api/devices", headers=hdr(A)).json() if x["device_id"] == "infusion-pump-097")
-    assert got["recent_peaks"] == d["recent_peaks"]
+    HA = hdr(login(c, "admin", "admin123").json()["token"])
+    amara = hdr(login(c, "nurse.amara", "nurse123").json()["token"]); ben = hdr(login(c, "nurse.ben", "nurse123").json()["token"])
+    now = _time.time()
+    def iso(ago): return _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now - ago))
+    def send(i, score, ago, dev="infusion-pump-097"):
+        c.portal.call(main.process, dict(base, message_id=f"h{i}", device_id=dev, risk_score=score, ingested_at=iso(ago)))
+    for i, (score, ago) in enumerate([(10, 1800), (95, 900), (20, 895), (30, 300), (5, 30)]):
+        send(i, score, ago)
+    send(9, 60, 29)                                                    # same 10 s slot as the 5: the higher score is kept
+    h = c.get("/api/devices/infusion-pump-097/history?minutes=60", headers=HA).json()
+    scores = [p["score"] for p in h["points"]]
+    assert h["minutes"] == 60 and 95 in scores and 60 in scores and 5 not in scores, scores
+    assert [p["t"] for p in h["points"]] == sorted(p["t"] for p in h["points"]) and len(scores) <= 125
+    short = [p["score"] for p in c.get("/api/devices/infusion-pump-097/history?minutes=15", headers=HA).json()["points"]]
+    assert 10 not in short and 95 in short                              # the 30-minute-old point is outside a 15-minute window
+    big = c.get("/api/devices/infusion-pump-097/history?minutes=100000", headers=HA).json()
+    assert big["minutes"] == main.HISTORY_HOURS * 60 and max(p["score"] for p in big["points"]) == 95   # clamped, thinned, peak kept
+    # access: amara owns infusion pumps, ben does not
+    assert c.get("/api/devices/infusion-pump-097/history", headers=amara).status_code == 200
+    assert c.get("/api/devices/infusion-pump-097/history", headers=ben).status_code == 404
+    assert c.get("/api/devices/nope/history", headers=HA).status_code == 404
+    assert c.get("/api/devices/infusion-pump-097/history").status_code == 401
+    # history export
+    r = c.get("/api/devices/infusion-pump-097/history?minutes=60&format=csv", headers=HA)
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/csv") and "attachment" in r.headers["content-disposition"]
+    rows = list(_csv.reader(_io.StringIO(r.text.lstrip("\ufeff"))))
+    assert rows[0] == ["device_id", "time", "max_risk_score"] and len(rows) == len(scores) + 1
+    assert c.get("/api/devices/infusion-pump-097/history?format=xml", headers=HA).status_code == 400
+    # audit export: admin only, filtered, audited, formula-safe
+    assert c.get("/api/audit/export", headers=amara).status_code == 403
+    assert c.get("/api/audit/export").status_code == 401
+    c.portal.call(main.log, "admin", "admin", "device_isolated", "=cmd|calc", "+1 detail")
+    r = c.get("/api/audit/export?action=device_isolated", headers=HA)
+    rows = list(_csv.DictReader(_io.StringIO(r.text.lstrip("\ufeff"))))
+    assert rows and all(x["action"] == "device_isolated" for x in rows)
+    assert any(x["target"] == "'=cmd|calc" and x["detail"] == "'+1 detail" for x in rows)
+    js = c.get("/api/audit/export?format=json&q=cmd", headers=HA).json()
+    assert len(js) >= 1 and js[0]["target"] == "=cmd|calc"            # JSON is not altered
+    assert any(e["action"] == "audit_exported" for e in main.auth.audit)
+    # alert export: role filtered
+    c.portal.call(main.process, dict(base, message_id="x1", device_id="cardiac-monitor-009", device_type="cardiac_monitor",
+                                     risk_score=90, ingested_at=iso(5), risk_reasons=["heart_rate_bpm = 300 (normal 50 to 120)"]))
+    ids = lambda hh: {x["device_id"] for x in _csv.DictReader(_io.StringIO(c.get("/api/alerts/export", headers=hh).text.lstrip("\ufeff")))}
+    assert "cardiac-monitor-009" in ids(HA) and "cardiac-monitor-009" in ids(ben) and "cardiac-monitor-009" not in ids(amara)
+    assert c.get("/api/alerts/export?format=json", headers=ben).json()[0]["device_id"].startswith("cardiac-monitor")
 print("all dashboard-api checks passed")
