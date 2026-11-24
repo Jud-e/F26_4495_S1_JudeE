@@ -15,6 +15,13 @@ export interface Alert {
   id: number; device_id: string; device_type?: string; unit?: string; reasons: string[];
   severity: "high" | "medium"; risk_score: number; explanations?: string[]; tips: string[]; at: string;
   ack: { by: string; at: string } | null;
+  remediation?: Remediation;
+}
+
+export interface Remediation {
+  status: "open" | "fixed" | "verified" | "reopened";
+  fixed: { by: string; at: string; note: string } | null;
+  verified_at: string | null; clean: number; reopens: number;
 }
 
 export interface AuditEntry { id: number; at: string; user: string; role: string; action: string; target: string; detail: string }
@@ -23,5 +30,5 @@ export type LiveEvent =
   | { type: "snapshot"; devices: Device[]; alerts: Alert[] }
   | { type: "device"; device: Device }
   | { type: "alert"; alert: Alert }
-  | { type: "alert_update"; alert: Alert }
+  | { type: "alert_update"; alert: Alert; reopened?: boolean }
   | { type: "audit"; entry: AuditEntry };

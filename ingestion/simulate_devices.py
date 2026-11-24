@@ -17,6 +17,8 @@ import csv
 import json
 import os
 import random
+import hashlib
+import hmac
 import time
 import uuid
 from datetime import datetime, timezone
@@ -25,7 +27,14 @@ from pathlib import Path
 import requests
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "https://localhost:8000")
-GATEWAY_API_TOKEN = os.getenv("GATEWAY_API_TOKEN", "dev-shared-secret-change-me")
+MASTER_SECRET = os.getenv("GATEWAY_API_TOKEN", "")   # same value as the gateway's .env; each device derives its own token from it
+if not MASTER_SECRET:
+    raise SystemExit("Set GATEWAY_API_TOKEN to the value in .env (run-demo.ps1 does this for you).")
+
+
+def device_token(device_id: str) -> str:
+    """Per-device token: HMAC-SHA256(master secret, device_id). Matches gateway/auth.py."""
+    return hmac.new(MASTER_SECRET.encode(), device_id.encode(), hashlib.sha256).hexdigest()
 GROUND_TRUTH_LOG = Path(__file__).parent / "ground_truth_log.csv"
 PATIENTS_PATH = Path(__file__).parent.parent / "data" / "patients.json"
 
@@ -183,7 +192,7 @@ def log_ground_truth(row: dict):
 
 
 def send_to_gateway(payload: dict):
-    headers = {"Authorization": f"Bearer {GATEWAY_API_TOKEN}"}
+    headers = {"Authorization": f"Bearer {device_token(payload['device_id'])}"}
     try:
         resp = requests.post(f"{GATEWAY_URL}/ingest", json=payload, headers=headers, timeout=5)
         body = resp.json() if resp.content else {}

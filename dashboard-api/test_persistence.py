@@ -100,6 +100,18 @@ with TestClient(main.app) as c:
     restored = next(a for a in c.get("/api/alerts", headers=H(admin)).json() if a["device_id"] == "infusion-pump-002")
     assert restored["explanations"] == why and "high_risk_score" in restored["reasons"]
 
+# ---- the remediation lifecycle survives a restart ----
+with TestClient(main.app) as c:
+    adm = c.post("/api/login", json={"username": "admin", "password": "admin123"}).json()["token"]
+    c.portal.call(main.process, dict(base, message_id="rm1", device_id="infusion-pump-004", vulnerability_flags=["tls_disabled"]))
+    aid = next(a["id"] for a in main.alerts if a["device_id"] == "infusion-pump-004")
+    assert c.post(f"/api/alerts/{aid}/fix", json={"note": "Turned TLS back on"}, headers=H(adm)).status_code == 200
+forget_everything()
+with TestClient(main.app) as c:
+    adm = c.post("/api/login", json={"username": "admin", "password": "admin123"}).json()["token"]
+    got = next(a for a in c.get("/api/alerts", headers=H(adm)).json() if a["id"] == aid)
+    assert got["remediation"]["status"] == "fixed" and got["remediation"]["fixed"]["note"] == "Turned TLS back on"
+
 # ---- risk history survives a restart, keeps the highest score per slot, and old rows are pruned ----
 import time as _time
 _now = _time.time()

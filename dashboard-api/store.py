@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     explanations JSONB NOT NULL DEFAULT '[]'
 );
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS explanations JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS remediation JSONB NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS alerts_device_idx ON alerts (device_id);
 CREATE TABLE IF NOT EXISTS audit_log (
     id        BIGINT PRIMARY KEY,
@@ -103,7 +104,7 @@ class Store:
         alerts = [{
             "id": r["id"], "device_id": r["device_id"], "device_type": r["device_type"], "unit": r["unit"],
             "reasons": r["reasons"], "severity": r["severity"], "risk_score": _number(r["risk_score"]),
-            "explanations": r["explanations"], "tips": r["tips"], "at": r["raised_at"],
+            "explanations": r["explanations"], "remediation": r["remediation"] or {}, "tips": r["tips"], "at": r["raised_at"],
             "ack": {"by": r["ack_by"], "at": r["ack_at"]} if r["ack_by"] else None,
         } for r in alert_rows]
         audit = [{
@@ -157,15 +158,19 @@ class Store:
         ack = a.get("ack") or {}
         with self.pool.connection() as conn:
             conn.execute(
-                "INSERT INTO alerts (id, device_id, device_type, unit, reasons, severity, risk_score, tips, raised_at, ack_by, ack_at, explanations) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO alerts (id, device_id, device_type, unit, reasons, severity, risk_score, tips, raised_at, ack_by, ack_at, explanations, remediation) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING",
                 (a["id"], a["device_id"], a.get("device_type"), a.get("unit"), Jsonb(a["reasons"]), a["severity"],
                  a["risk_score"], Jsonb(a.get("tips") or []), a["at"], ack.get("by"), ack.get("at"),
-                 Jsonb(a.get("explanations") or [])))
+                 Jsonb(a.get("explanations") or []), Jsonb(a.get("remediation") or {})))
 
     def ack_alert(self, alert_id: int, by: str, at: str) -> None:
         with self.pool.connection() as conn:
             conn.execute("UPDATE alerts SET ack_by = %s, ack_at = %s WHERE id = %s", (by, at, alert_id))
+
+    def save_remediation(self, alert_id: int, remediation: dict) -> None:
+        with self.pool.connection() as conn:
+            conn.execute("UPDATE alerts SET remediation = %s WHERE id = %s", (Jsonb(remediation), alert_id))
 
     def save_audit(self, e: dict) -> None:
         with self.pool.connection() as conn:

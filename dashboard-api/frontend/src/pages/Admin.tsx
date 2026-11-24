@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import { Chips, DeviceLabel, ExportButtons, RiskCell, TopBar } from "../components/parts";
+import { Chips, DeviceLabel, ExportButtons, FixForm, FixInfo, RiskCell, StatusPill, TopBar, isOpen, statusOf } from "../components/parts";
 import RiskChart, { PeriodPicker } from "../components/riskChart";
 import { ago, clock, explain, readings, riskClass } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
@@ -16,14 +16,16 @@ function Tile({ label, n, cls = "" }: { label: string; n: number; cls?: string }
 
 function AlertRow({ a }: { a: Alert }) {
   return (
-    <li className={a.severity + (a.ack ? " acked" : "")}>
+    <li className={a.severity + (a.ack ? " acked" : "") + (statusOf(a) === "verified" ? " verified" : "")}>
       <div className="row">
-        <div><span className={"pill " + (a.severity === "high" ? "crit" : "warn")}>{a.severity}</span> <strong>{a.device_id}</strong></div>
+        <div><span className={"pill " + (a.severity === "high" ? "crit" : "warn")}>{a.severity}</span> <StatusPill a={a} /> <strong>{a.device_id}</strong></div>
         <span className="sub">{ago(a.at)} · risk {a.risk_score}</span>
       </div>
       <Chips items={a.reasons} />
       {a.explanations?.map((e) => <div key={e} className="sub">Why: {explain(e)}</div>)}
       <div className="sub">{a.ack ? `Acknowledged by ${a.ack.by} ${ago(a.ack.at)}` : "Not yet acknowledged"}</div>
+      <FixInfo a={a} />
+      <FixForm a={a} />
     </li>
   );
 }
@@ -129,7 +131,8 @@ export default function Admin({ user }: { user: User }) {
   useEffect(() => { history.replaceState(null, "", "#" + tab); }, [tab]);
   useEffect(() => { api<AuditEntry[]>("/api/audit").then(loadAudit).catch(() => {}); }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
-  const open = alerts.filter((a) => !a.ack);
+  const open = alerts.filter(isOpen);
+  const rechecking = alerts.filter((a) => statusOf(a) === "fixed");
 
   return (
     <>
@@ -148,7 +151,8 @@ export default function Admin({ user }: { user: User }) {
             <div className="tiles" id="tiles">
               <Tile label="Devices" n={devices.length} />
               <Tile label="High risk (70+)" n={devices.filter((d) => d.risk_score >= 70).length} cls="crit" />
-              <Tile label="Unacknowledged alerts" n={open.length} cls={open.length ? "warn" : ""} />
+              <Tile label="Open problems" n={open.length} cls={open.length ? "warn" : ""} />
+              <Tile label="Fixed, rechecking" n={rechecking.length} />
               <Tile label="Isolated" n={devices.filter((d) => d.isolated).length} />
             </div>
             <div className="cols" style={{ marginTop: 18 }}>

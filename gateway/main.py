@@ -20,9 +20,12 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 import isolation
+import limits
 from auth import verify_token
 from kafka_producer import publish
 from patient_registry import get_patient
@@ -39,9 +42,52 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="MedGuard Zero-Trust Gateway", lifespan=lifespan)
+# The interactive docs and schema are for development only; they hand an attacker the exact payload shapes.
+_docs = os.getenv("ENABLE_DOCS") == "1"
+app = FastAPI(title="MedGuard Zero-Trust Gateway", lifespan=lifespan,
+              docs_url="/docs" if _docs else None, redoc_url=None, openapi_url="/openapi.json" if _docs else None)
 
 TOPIC_RAW = os.getenv("TOPIC_TELEMETRY_RAW", "iomt.telemetry.raw")
+TOPIC_REJECTED = os.getenv("TOPIC_TELEMETRY_REJECTED", "iomt.telemetry.rejected")   # dead-letter topic
+MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", "16384"))
+MAX_CLOCK_SKEW_S = int(os.getenv("MAX_CLOCK_SKEW_S", "300"))
+
+
+def reset_state() -> None:
+    limits.reset()
+
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    """Refuse oversized or unsized request bodies before anything reads them into memory."""
+    if request.method in ("POST", "PUT", "PATCH"):
+        length = request.headers.get("content-length")
+        if length is None:
+            return JSONResponse(status_code=411, content={"detail": "Content-Length required"})
+        if not length.isdigit() or int(length) > MAX_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"detail": f"Request body larger than {MAX_BODY_BYTES} bytes"})
+    return await call_next(request)
+
+
+def reject(request: Request, reason: str, detail, body: bytes = b"") -> None:
+    """Dead-letter record for an authenticated message that was refused. Best effort: never breaks the request."""
+    try:
+        publish(TOPIC_REJECTED, key=None, value={
+            "reason": reason, "detail": detail,
+            "client": request.client.host if request.client else None,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "payload_excerpt": body[:1024].decode("utf-8", "replace"),
+        })
+    except Exception as exc:
+        print(f"dead-letter publish failed: {exc}")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_failed(request: Request, exc: RequestValidationError):
+    errors = [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+    if getattr(request.state, "authenticated", False):      # only credentialed senders can add to the dead-letter topic
+        reject(request, "schema_validation", errors[:10], await request.body())
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 @app.get("/health")
@@ -56,7 +102,10 @@ def health():
 
 
 @app.post("/ingest", status_code=status.HTTP_201_CREATED)
-def ingest(payload: TelemetryPayload, _authorized: bool = Depends(verify_token)):
+def ingest(request: Request, payload: TelemetryPayload, _authorized: bool = Depends(verify_token)):
+    if not limits.device_rate.allow(payload.device_id):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded for this device",
+                            headers={"Retry-After": "5"})
     reg = isolation.registry
     if not reg.ready:
         raise HTTPException(
@@ -70,6 +119,15 @@ def ingest(payload: TelemetryPayload, _authorized: bool = Depends(verify_token))
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Device is isolated by an administrator",
         )
+
+    ts = payload.timestamp if payload.timestamp.tzinfo else payload.timestamp.replace(tzinfo=timezone.utc)
+    if abs((datetime.now(timezone.utc) - ts).total_seconds()) > MAX_CLOCK_SKEW_S:
+        reject(request, "stale_or_future_timestamp", str(payload.timestamp), payload.model_dump_json().encode())
+        raise HTTPException(status_code=422, detail=f"timestamp must be within {MAX_CLOCK_SKEW_S} seconds of the gateway clock")
+    replay_key = (payload.device_id, payload.message_id)
+    if limits.replays.is_replay(replay_key):
+        reject(request, "replayed_message_id", payload.message_id, b"")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Duplicate message_id (replay refused)")
 
     message = payload.model_dump(mode="json")
 
@@ -93,7 +151,12 @@ def ingest(payload: TelemetryPayload, _authorized: bool = Depends(verify_token))
 
     message["ingested_at"] = datetime.now(timezone.utc).isoformat()
 
-    publish(TOPIC_RAW, key=payload.device_id, value=message)
+    try:
+        publish(TOPIC_RAW, key=payload.device_id, value=message)
+    except Exception as exc:        # log the real cause here; the caller only learns that it should retry
+        print(f"ERROR: could not publish to Kafka: {exc}")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Pipeline temporarily unavailable; retry shortly")
+    limits.replays.remember(replay_key)
 
     return {
         "message_id": payload.message_id,

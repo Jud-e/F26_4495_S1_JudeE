@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api } from "../api";
-import { ExportButtons, TopBar } from "../components/parts";
+import { ExportButtons, FixForm, FixInfo, StatusPill, TopBar, isOpen, statusOf } from "../components/parts";
 import RiskChart, { PeriodPicker } from "../components/riskChart";
 import { useToast } from "../components/toasts";
 import { ago, explain, plain, readings } from "../format";
@@ -35,17 +35,22 @@ function AlertCard({ a }: { a: Alert }) {
     catch (e) { window.alert((e as Error).message); setBusy(false); }
   }
   return (
-    <li className={a.severity + (a.ack ? " acked" : "")}>
+    <li className={a.severity + (a.ack ? " acked" : "") + (statusOf(a) === "verified" ? " verified" : "")}>
       <div className="row">
-        <div><span className={"pill " + (a.severity === "high" ? "crit" : "warn")}>{a.severity === "high" ? "urgent" : "check"}</span> <strong>{a.device_id}</strong></div>
+        <div><span className={"pill " + (a.severity === "high" ? "crit" : "warn")}>{a.severity === "high" ? "urgent" : "check"}</span> <StatusPill a={a} /> <strong>{a.device_id}</strong></div>
         <span className="sub">{ago(a.at)}</span>
       </div>
       <ul style={{ margin: 0, paddingLeft: 18 }}>{a.reasons.map((r) => <li key={r}>{plain(r)}</li>)}</ul>
       {a.explanations?.map((e) => <div key={e} className="sub">Why flagged: {explain(e)}</div>)}
       {a.tips.map((t) => <div key={t} className="sub">What to do: {t}</div>)}
-      {a.ack
-        ? <div className="sub">Acknowledged by {a.ack.by} {ago(a.ack.at)}</div>
-        : <button className="primary small" style={{ alignSelf: "flex-start" }} disabled={busy} onClick={ack}>Acknowledge</button>}
+      {a.ack && <div className="sub">Acknowledged by {a.ack.by} {ago(a.ack.at)}</div>}
+      <FixInfo a={a} />
+      {isOpen(a) && (
+        <div className="actions">
+          {!a.ack && <button className="primary small" disabled={busy} onClick={ack}>Acknowledge</button>}
+          <FixForm a={a} />
+        </div>
+      )}
     </li>
   );
 }
@@ -56,10 +61,10 @@ export default function Nurse({ user }: { user: User }) {
   const [minutes, setMinutes] = useState(60);
   const [perm, setPerm] = useState<string>(canPush ? Notification.permission : "unsupported");
 
-  const { devices, alerts, connected } = useLive((a) => {
-    const title = (a.severity === "high" ? "URGENT: " : "Alert: ") + a.device_id;
-    const body = a.reasons.map(plain).join("; ");
-    toast(title, body, a.severity);
+  const { devices, alerts, connected } = useLive((a, reopened) => {
+    const title = (reopened ? "FIX FAILED: " : a.severity === "high" ? "URGENT: " : "Alert: ") + a.device_id;
+    const body = (reopened ? "The problem is still there after the fix. " : "") + a.reasons.map(plain).join("; ");
+    toast(title, body, reopened ? "high" : a.severity);
     if (canPush && Notification.permission === "granted") {
       try {
         const n = new Notification(title, { body, tag: "alert-" + a.id, requireInteraction: a.severity === "high" });
@@ -68,8 +73,9 @@ export default function Nurse({ user }: { user: User }) {
     }
   });
 
-  const open = alerts.filter((a) => !a.ack);
-  const done = alerts.filter((a) => a.ack);
+  const open = alerts.filter(isOpen);
+  const waiting = alerts.filter((a) => statusOf(a) === "fixed");
+  const done = alerts.filter((a) => statusOf(a) === "verified");
   document.title = (open.length ? `(${open.length}) ` : "") + "MedGuard nurse";
 
   async function enable() { try { setPerm(await Notification.requestPermission()); } catch { /* ignore */ } }
@@ -103,10 +109,17 @@ export default function Nurse({ user }: { user: User }) {
           {open.length === 0 && <div className="empty">Nothing needs your attention right now.</div>}
         </section>
 
+        {waiting.length > 0 && (
+          <section className="panel">
+            <h2>Fixed, waiting for the recheck <span className="pill plain">{waiting.length}</span></h2>
+            <ul className="alerts">{waiting.map((a) => <AlertCard key={a.id} a={a} />)}</ul>
+          </section>
+        )}
+
         <section className="panel">
-          <div className="toolbar"><h2 style={{ margin: 0 }}>Acknowledged</h2><ExportButtons path="/api/alerts/export" label="Export my alerts" /></div>
+          <div className="toolbar"><h2 style={{ margin: 0 }}>Resolved</h2><ExportButtons path="/api/alerts/export" label="Export my alerts" /></div>
           <ul className="alerts" id="done">{done.slice(0, 20).map((a) => <AlertCard key={a.id} a={a} />)}</ul>
-          {done.length === 0 && <div className="empty">No acknowledged alerts yet.</div>}
+          {done.length === 0 && <div className="empty">Nothing verified yet. A fix is verified when the device reports cleanly after it.</div>}
         </section>
       </main>
     </>

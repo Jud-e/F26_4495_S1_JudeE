@@ -38,11 +38,11 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from kafka import KafkaConsumer, KafkaProducer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import auth
 import store as store_module
@@ -51,6 +51,10 @@ KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC_SCORED = os.getenv("TOPIC_TELEMETRY_SCORED", "iomt.telemetry.scored")
 # Risk score (0-100) at or above which a device raises a high-risk alert.
 TOPIC_ACTIONS = os.getenv("TOPIC_ACTIONS", "iomt.actions")
+# Remediation recheck: after someone marks an alert fixed, the device must send this many clean messages, spread over
+# at least this many seconds, before the fix counts as verified. Any message that still shows the problem reopens it.
+RECHECK_CLEAN_MESSAGES = int(os.getenv("RECHECK_CLEAN_MESSAGES", "5"))
+RECHECK_MIN_SECONDS = int(os.getenv("RECHECK_MIN_SECONDS", "30"))
 RISK_ALERT_THRESHOLD = int(os.getenv("RISK_ALERT_THRESHOLD", "70"))
 # Risk history: each device keeps the highest score per HISTORY_BUCKET_S slot for HISTORY_HOURS, so the
 # dashboard can draw risk-over-time charts that survive a restart (stored in Postgres when it is on).
@@ -109,6 +113,8 @@ def restore_from_db() -> None:
         history.setdefault(device_id, {})[bucket] = score
     alerts.clear()
     alerts.extend(data["alerts"])                          # newest first, as stored
+    for a in alerts:
+        remediation_of(a)
     _alert_seq = max(_alert_seq, data["max_alert_id"])
     auth.restore_audit(data["audit"], data["max_audit_id"])
     print(f"dashboard-api: restored {len(devices)} devices, {len(alerts)} alerts, {len(data['audit'])} audit entries")
@@ -173,6 +179,60 @@ def history_points(device_id: str, minutes: int) -> dict:
             "points": [{"t": b, "score": merged[b]} for b in sorted(merged)]}
 
 
+def new_remediation() -> dict:
+    """Lifecycle of the problem behind an alert: open -> fixed (waiting for the recheck) -> verified, or back to reopened."""
+    return {"status": "open", "fixed": None, "verified_at": None, "clean": 0, "reopens": 0}
+
+
+def remediation_of(alert: dict) -> dict:
+    """The alert's remediation record, filled in for alerts saved before this feature existed."""
+    rem = alert.setdefault("remediation", {})
+    for k, v in new_remediation().items():
+        rem.setdefault(k, v)
+    return rem
+
+
+def reasons_of(state: dict) -> set[str]:
+    return set(signature_for(state).split("|")) - {""}
+
+
+async def recheck(state: dict) -> list[dict]:
+    """Test every alert of this device that is marked fixed against the newest message. Returns the alerts it reopened."""
+    reopened = []
+    t = _epoch(state["last_seen"])
+    if t is None:
+        return reopened
+    for alert in alerts:
+        rem = remediation_of(alert)
+        if alert["device_id"] != state["device_id"] or rem["status"] != "fixed":
+            continue
+        fixed_at = _epoch(rem["fixed"]["at"])
+        if fixed_at is None or t <= fixed_at:
+            continue                                   # a message from before the fix says nothing about it
+        still = sorted(set(alert["reasons"]) & reasons_of(state))
+        if still:
+            rem["status"], rem["clean"] = "reopened", 0
+            rem["reopens"] += 1
+            reopened.append(alert)
+            await persist("save_remediation", alert["id"], rem)
+            await broadcast({"type": "alert_update", "alert": alert, "reopened": True}, device_id=alert["device_id"])
+            await log("system", "system", "fix_failed", alert["device_id"],
+                      f'alert #{alert["id"]}: problem still present after the fix ({", ".join(still)}); reopened, '
+                      f'notified {", ".join(auth.nurses_for(alert["device_id"])) or "no assigned nurse"}')
+            continue
+        rem["clean"] += 1
+        if rem["clean"] >= RECHECK_CLEAN_MESSAGES and t - fixed_at >= RECHECK_MIN_SECONDS:
+            rem["status"], rem["verified_at"] = "verified", state["last_seen"]
+            await persist("save_remediation", alert["id"], rem)
+            await broadcast({"type": "alert_update", "alert": alert}, device_id=alert["device_id"])
+            await log("system", "system", "fix_verified", alert["device_id"],
+                      f'alert #{alert["id"]}: {rem["clean"]} clean messages over {int(t - fixed_at)} s after the fix')
+        else:
+            await persist("save_remediation", alert["id"], rem)
+            await broadcast({"type": "alert_update", "alert": alert}, device_id=alert["device_id"])
+    return reopened
+
+
 def maybe_alert(state: dict) -> dict | None:
     """Create an alert when a device's set of problems changes.
 
@@ -203,6 +263,7 @@ def maybe_alert(state: dict) -> dict | None:
         "tips": state["tips"],
         "at": state["last_seen"] or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "ack": None,   # becomes {"by": username, "at": time} when acknowledged
+        "remediation": new_remediation(),
     }
 
 
@@ -241,7 +302,11 @@ async def process(rec: dict) -> None:
     if changed:
         await persist("save_history", state["device_id"], *changed)
     await broadcast({"type": "device", "device": state}, device_id=state["device_id"])
-    alert = maybe_alert(state)
+    if await recheck(state):                 # a failed fix reopens its alert instead of raising a second one
+        _signatures[state["device_id"]] = signature_for(state)
+        alert = None
+    else:
+        alert = maybe_alert(state)
     if alert:
         alerts.appendleft(alert)
         await persist("save_alert", alert)
@@ -357,7 +422,27 @@ async def lifespan(app: FastAPI):
         db.close()
 
 
-app = FastAPI(title="MedGuard Dashboard API", lifespan=lifespan)
+# Interactive docs and the schema are for development only (ENABLE_DOCS=1); they are not shown to anonymous visitors.
+_docs = os.getenv("ENABLE_DOCS") == "1"
+app = FastAPI(title="MedGuard Dashboard API", lifespan=lifespan,
+              docs_url="/docs" if _docs else None, redoc_url=None, openapi_url="/openapi.json" if _docs else None)
+
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Browser-side protections: no inline scripts (XSS), no framing (clickjacking), no MIME sniffing, no caching of data."""
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 # The React app is built into WEB_DIR: /srv/web inside the Docker image, or frontend/dist when
 # running locally after `npm run build`. It lives outside /app so the dev volume mount cannot hide it.
 WEB_DIR = Path(os.getenv("WEB_DIR") or ("/srv/web" if Path("/srv/web").is_dir() else Path(__file__).parent / "frontend" / "dist"))
@@ -400,16 +485,24 @@ def favicon():
 
 # ---------- auth ----------
 class LoginBody(BaseModel):
-    username: str
-    password: str
+    username: str = Field(max_length=64)
+    password: str = Field(max_length=128)
 
 
 @app.post("/api/login")
-async def login(body: LoginBody):
+async def login(body: LoginBody, request: Request):
     username = body.username.strip().lower()
+    client = request.client.host if request.client else "unknown"
+    if auth.login_blocked(client, username):
+        raise HTTPException(status_code=429, detail="Too many failed sign-in attempts. Try again in a few minutes.",
+                            headers={"Retry-After": str(auth.LOGIN_WINDOW_S)})
     if not auth.check_password(username, body.password):
+        locked = auth.login_failed(client, username)
         await log(username[:40] or "?", "-", "login_failed", "", "wrong username or password")
+        if locked:   # one audit line when a lockout starts, instead of one per blocked attempt
+            await log(username[:40] or "?", "-", "login_locked", "", f"sign-in blocked for {auth.LOGIN_WINDOW_S // 60} min after repeated failures from {client}")
         raise HTTPException(status_code=401, detail="Wrong username or password")
+    auth.login_succeeded(client, username)
     token = auth.new_session(username)
     user = auth.public(username)
     await log(username, user["role"], "login")
@@ -456,6 +549,30 @@ async def ack_alert(alert_id: int, user: dict = Depends(auth.current_user)):
         await persist("ack_alert", alert_id, alert["ack"]["by"], alert["ack"]["at"])
         await broadcast({"type": "alert_update", "alert": alert}, device_id=alert["device_id"])
         await log(user["username"], user["role"], "alert_ack", alert["device_id"], f"alert #{alert_id}")
+    return alert
+
+
+class FixBody(BaseModel):
+    note: str = Field(min_length=3, max_length=500)
+
+
+@app.post("/api/alerts/{alert_id}/fix")
+async def mark_fixed(alert_id: int, body: FixBody, user: dict = Depends(auth.current_user)):
+    """Say what was done about an alert. The system then rechecks the device's next messages before calling it verified."""
+    alert = next((a for a in alerts if a["id"] == alert_id and auth.can_see(user, a["device_id"])), None)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    rem = remediation_of(alert)
+    if rem["status"] not in ("open", "reopened"):
+        raise HTTPException(status_code=409, detail=f"Alert is already {rem['status']}")
+    rem["status"], rem["clean"] = "fixed", 0
+    rem["fixed"] = {"by": user["username"], "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "note": body.note.strip()}
+    if not alert["ack"]:
+        alert["ack"] = {"by": user["username"], "at": rem["fixed"]["at"]}
+        await persist("ack_alert", alert_id, alert["ack"]["by"], alert["ack"]["at"])
+    await persist("save_remediation", alert_id, rem)
+    await broadcast({"type": "alert_update", "alert": alert}, device_id=alert["device_id"])
+    await log(user["username"], user["role"], "alert_fixed", alert["device_id"], f"alert #{alert_id}: {rem['fixed']['note']}")
     return alert
 
 
@@ -533,10 +650,14 @@ async def export_audit(format: str = "csv", action: str = "", user_filter: str =
 async def export_alerts(format: str = "csv", user: dict = Depends(auth.current_user)):
     """Alerts the signed-in user is allowed to see (a nurse gets only their devices), newest first."""
     rows = [{**a, "acked_by": (a["ack"] or {}).get("by"), "acked_at": (a["ack"] or {}).get("at"),
-             "reasons": "; ".join(a["reasons"]), "explanations": "; ".join(a.get("explanations") or [])}
+             "reasons": "; ".join(a["reasons"]), "explanations": "; ".join(a.get("explanations") or []),
+             "status": remediation_of(a)["status"], "fixed_by": (remediation_of(a)["fixed"] or {}).get("by"),
+             "fixed_at": (remediation_of(a)["fixed"] or {}).get("at"), "fix_note": (remediation_of(a)["fixed"] or {}).get("note"),
+             "verified_at": remediation_of(a)["verified_at"], "reopens": remediation_of(a)["reopens"]}
             for a in visible_alerts(user)]
     resp = export_response(rows, ["id", "at", "device_id", "device_type", "unit", "severity", "risk_score", "reasons",
-                                  "explanations", "acked_by", "acked_at"], format, "medguard-alerts")
+                                  "explanations", "acked_by", "acked_at", "status", "fixed_by", "fixed_at", "fix_note", "verified_at", "reopens"],
+                           format, "medguard-alerts")
     await log(user["username"], user["role"], "alerts_exported", "alerts", f"{len(rows)} alerts as {format}")
     return resp
 

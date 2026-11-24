@@ -15,10 +15,12 @@ def get_producer() -> KafkaProducer:
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
+        max_block_ms=5000,      # fail fast if the broker is down instead of hanging the request
+        request_timeout_ms=5000,
     )
 
 
 def publish(topic: str, key: str, value: dict) -> None:
     producer = get_producer()
     producer.send(topic, key=key, value=value)
-    producer.flush()
+    producer.flush(timeout=5)

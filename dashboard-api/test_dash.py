@@ -189,4 +189,58 @@ with TestClient(main.app) as c:
     ids = lambda hh: {x["device_id"] for x in _csv.DictReader(_io.StringIO(c.get("/api/alerts/export", headers=hh).text.lstrip("\ufeff")))}
     assert "cardiac-monitor-009" in ids(HA) and "cardiac-monitor-009" in ids(ben) and "cardiac-monitor-009" not in ids(amara)
     assert c.get("/api/alerts/export?format=json", headers=ben).json()[0]["device_id"].startswith("cardiac-monitor")
+# ---- remediation: flagged -> fixed -> rechecked ----
+with TestClient(main.app) as c:
+    HA = hdr(login(c, "admin", "admin123").json()["token"])
+    amara = hdr(login(c, "nurse.amara", "nurse123").json()["token"]); ben = hdr(login(c, "nurse.ben", "nurse123").json()["token"])
+    main.RECHECK_CLEAN_MESSAGES, main.RECHECK_MIN_SECONDS = 3, 20
+    t0 = _time.time()
+    def stamp(off): return _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(t0 + off))
+    def msg(dev, flags, off, n=[0]):
+        n[0] += 1
+        c.portal.call(main.process, dict(base, message_id=f"r{n[0]}", device_id=dev, vulnerability_flags=flags, risk_score=0, ingested_at=stamp(off)))
+    def alert_for(dev): return next(a for a in c.get("/api/alerts", headers=HA).json() if a["device_id"] == dev)
+
+    # happy path: flagged, marked fixed, three clean messages over 20+ seconds -> verified
+    msg("infusion-pump-081", ["tls_disabled"], -5)
+    a = alert_for("infusion-pump-081"); assert a["remediation"]["status"] == "open"
+    assert c.post(f"/api/alerts/{a['id']}/fix", json={"note": "x"}, headers=amara).status_code == 422          # a note is required
+    assert c.post(f"/api/alerts/{a['id']}/fix", json={"note": "Re-enabled TLS"}, headers=ben).status_code == 404   # not ben's device
+    r = c.post(f"/api/alerts/{a['id']}/fix", json={"note": "Re-enabled TLS on the pump"}, headers=amara).json()
+    assert r["remediation"]["status"] == "fixed" and r["remediation"]["fixed"]["by"] == "nurse.amara" and r["ack"]["by"] == "nurse.amara"
+    assert c.post(f"/api/alerts/{a['id']}/fix", json={"note": "again please"}, headers=amara).status_code == 409
+    msg("infusion-pump-081", [], -10)                       # older than the fix: ignored
+    assert alert_for("infusion-pump-081")["remediation"]["clean"] == 0
+    msg("infusion-pump-081", [], 5); msg("infusion-pump-081", [], 12)
+    assert alert_for("infusion-pump-081")["remediation"]["status"] == "fixed"     # two clean so far
+    msg("infusion-pump-081", [], 15)                        # three clean, but only 15 s since the fix
+    assert alert_for("infusion-pump-081")["remediation"]["status"] == "fixed"
+    msg("infusion-pump-081", [], 25)
+    rem = alert_for("infusion-pump-081")["remediation"]
+    assert rem["status"] == "verified" and rem["verified_at"] == stamp(25)
+    actions = [e["action"] for e in main.auth.audit]
+    assert "alert_fixed" in actions and "fix_verified" in actions
+
+    # the fix did not work: the same problem comes back -> reopened, no second alert, audited
+    msg("infusion-pump-082", ["tls_disabled"], -5); b = alert_for("infusion-pump-082")
+    c.post(f"/api/alerts/{b['id']}/fix", json={"note": "Changed the setting"}, headers=HA)
+    before = len([x for x in main.alerts if x["device_id"] == "infusion-pump-082"])
+    msg("infusion-pump-082", [], 5)
+    msg("infusion-pump-082", ["tls_disabled"], 10)          # clears, then returns before the recheck finishes
+    b = alert_for("infusion-pump-082")
+    assert b["remediation"]["status"] == "reopened" and b["remediation"]["reopens"] == 1 and b["remediation"]["clean"] == 0
+    assert len([x for x in main.alerts if x["device_id"] == "infusion-pump-082"]) == before       # no duplicate alert
+    assert any(e["action"] == "fix_failed" and "tls_disabled" in e["detail"] for e in main.auth.audit)
+    assert c.post(f"/api/alerts/{b['id']}/fix", json={"note": "Second attempt, replaced cert"}, headers=HA).status_code == 200   # can be fixed again
+
+    # a different problem on the same device does not count as the old one coming back
+    msg("infusion-pump-083", ["tls_disabled"], -5); d = alert_for("infusion-pump-083")
+    c.post(f"/api/alerts/{d['id']}/fix", json={"note": "Fixed TLS"}, headers=HA)
+    msg("infusion-pump-083", ["firmware_outdated"], 5)
+    assert next(x for x in c.get("/api/alerts", headers=HA).json() if x["id"] == d["id"])["remediation"]["status"] == "fixed"
+
+    # export carries the lifecycle
+    rows = list(_csv.DictReader(_io.StringIO(c.get("/api/alerts/export", headers=HA).text.lstrip("\ufeff"))))
+    row = next(x for x in rows if x["device_id"] == "infusion-pump-081")
+    assert row["status"] == "verified" and row["fixed_by"] == "nurse.amara" and row["fix_note"] == "Re-enabled TLS on the pump"
 print("all dashboard-api checks passed")
