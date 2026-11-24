@@ -10,6 +10,12 @@ if (-not (Get-Command mkcert -ErrorAction SilentlyContinue)) {
 }
 $env:REQUESTS_CA_BUNDLE = Join-Path (mkcert -CAROOT) "rootCA.pem"
 
+# The simulator derives each device's token from GATEWAY_API_TOKEN in .env (the same secret the gateway uses).
+if (-not (Test-Path .env)) { throw ".env not found. Copy .env.example to .env and set POSTGRES_PASSWORD and GATEWAY_API_TOKEN." }
+$line = Get-Content .env | Where-Object { $_ -match '^\s*GATEWAY_API_TOKEN\s*=' } | Select-Object -First 1
+if (-not $line) { throw "GATEWAY_API_TOKEN is missing from .env (see .env.example)." }
+$env:GATEWAY_API_TOKEN = ($line -split '=', 2)[1].Trim()
+
 if ($Frontend) {
     Push-Location dashboard-api\frontend
     npm install --no-audit --no-fund

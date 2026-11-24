@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     explanations JSONB NOT NULL DEFAULT '[]'
 );
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS explanations JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS remediation JSONB NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS alerts_device_idx ON alerts (device_id);
 CREATE TABLE IF NOT EXISTS audit_log (
     id        BIGINT PRIMARY KEY,
@@ -45,6 +46,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action    TEXT NOT NULL,
     target    TEXT NOT NULL DEFAULT '',
     detail    TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS risk_history (
+    device_id TEXT NOT NULL,
+    bucket    BIGINT NOT NULL,          -- start of a 10 second slot, in epoch seconds
+    score     DOUBLE PRECISION NOT NULL, -- highest risk score seen in that slot
+    PRIMARY KEY (device_id, bucket)
 );
 """
 
@@ -97,7 +104,7 @@ class Store:
         alerts = [{
             "id": r["id"], "device_id": r["device_id"], "device_type": r["device_type"], "unit": r["unit"],
             "reasons": r["reasons"], "severity": r["severity"], "risk_score": _number(r["risk_score"]),
-            "explanations": r["explanations"], "tips": r["tips"], "at": r["raised_at"],
+            "explanations": r["explanations"], "remediation": r["remediation"] or {}, "tips": r["tips"], "at": r["raised_at"],
             "ack": {"by": r["ack_by"], "at": r["ack_at"]} if r["ack_by"] else None,
         } for r in alert_rows]
         audit = [{
@@ -106,7 +113,40 @@ class Store:
         } for r in audit_rows]
         return {"devices": devices, "alerts": alerts, "audit": audit, "max_alert_id": max_alert, "max_audit_id": max_audit_id}
 
+    def load_history(self, since_epoch: int) -> list[tuple]:
+        with self.pool.connection() as conn:
+            rows = conn.execute("SELECT device_id, bucket, score FROM risk_history WHERE bucket >= %s ORDER BY bucket",
+                                (since_epoch,)).fetchall()
+        return [(r["device_id"], r["bucket"], _number(r["score"])) for r in rows]
+
+    def audit_rows(self, action: str = "", user: str = "", text: str = "", since: str = "") -> list[dict]:
+        """The full audit log (not just the most recent entries kept in memory), oldest first, optionally filtered."""
+        where, args = ["TRUE"], []
+        if action:
+            where.append("action = %s"); args.append(action)
+        if user:
+            where.append("username = %s"); args.append(user)
+        if text:
+            where.append("(target || ' ' || detail || ' ' || username) ILIKE %s"); args.append(f"%{text}%")
+        if since:
+            where.append("logged_at >= %s"); args.append(since)
+        with self.pool.connection() as conn:
+            rows = conn.execute(f"SELECT * FROM audit_log WHERE {' AND '.join(where)} ORDER BY id", args).fetchall()
+        return [{"id": r["id"], "at": r["logged_at"], "user": r["username"], "role": r["role"],
+                 "action": r["action"], "target": r["target"], "detail": r["detail"]} for r in rows]
+
     # ---- writing ----
+    def save_history(self, device_id: str, bucket: int, score: float) -> None:
+        with self.pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO risk_history (device_id, bucket, score) VALUES (%s,%s,%s) "
+                "ON CONFLICT (device_id, bucket) DO UPDATE SET score = GREATEST(risk_history.score, EXCLUDED.score)",
+                (device_id, bucket, score))
+
+    def prune_history(self, before_epoch: int) -> None:
+        with self.pool.connection() as conn:
+            conn.execute("DELETE FROM risk_history WHERE bucket < %s", (before_epoch,))
+
     def save_device(self, state: dict) -> None:
         with self.pool.connection() as conn:
             conn.execute(
@@ -118,15 +158,19 @@ class Store:
         ack = a.get("ack") or {}
         with self.pool.connection() as conn:
             conn.execute(
-                "INSERT INTO alerts (id, device_id, device_type, unit, reasons, severity, risk_score, tips, raised_at, ack_by, ack_at, explanations) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO alerts (id, device_id, device_type, unit, reasons, severity, risk_score, tips, raised_at, ack_by, ack_at, explanations, remediation) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING",
                 (a["id"], a["device_id"], a.get("device_type"), a.get("unit"), Jsonb(a["reasons"]), a["severity"],
                  a["risk_score"], Jsonb(a.get("tips") or []), a["at"], ack.get("by"), ack.get("at"),
-                 Jsonb(a.get("explanations") or [])))
+                 Jsonb(a.get("explanations") or []), Jsonb(a.get("remediation") or {})))
 
     def ack_alert(self, alert_id: int, by: str, at: str) -> None:
         with self.pool.connection() as conn:
             conn.execute("UPDATE alerts SET ack_by = %s, ack_at = %s WHERE id = %s", (by, at, alert_id))
+
+    def save_remediation(self, alert_id: int, remediation: dict) -> None:
+        with self.pool.connection() as conn:
+            conn.execute("UPDATE alerts SET remediation = %s WHERE id = %s", (Jsonb(remediation), alert_id))
 
     def save_audit(self, e: dict) -> None:
         with self.pool.connection() as conn:

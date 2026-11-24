@@ -7,9 +7,10 @@ bearer token -> role and device checks on every request) is what a real
 implementation would keep; only USERS and login() would change.
 """
 import fnmatch
+import os
 import secrets
 import time
-from collections import deque
+from collections import defaultdict, deque
 
 from fastapi import Header, HTTPException
 
@@ -30,7 +31,8 @@ USERS = {
     },
 }
 
-sessions: dict[str, str] = {}        # bearer token -> username
+SESSION_TTL_S = int(os.getenv("SESSION_TTL_S", str(8 * 3600)))   # one shift; after this the user must sign in again
+sessions: dict[str, dict] = {}       # bearer token -> {"user": username, "expires": epoch seconds}
 audit: deque = deque(maxlen=1000)    # newest first
 _audit_seq = 0
 
@@ -57,14 +59,59 @@ def check_password(username: str, password: str) -> bool:
 
 
 def new_session(username: str) -> str:
+    now = time.time()
+    for t in [t for t, s in sessions.items() if s["expires"] <= now]:   # drop expired sessions so the table cannot grow forever
+        del sessions[t]
     token = secrets.token_urlsafe(24)
-    sessions[token] = username
+    sessions[token] = {"user": username, "expires": now + SESSION_TTL_S}
     return token
 
 
 def user_for_token(token: str | None) -> dict | None:
-    username = sessions.get(token or "")
-    return public(username) if username else None
+    session = sessions.get(token or "")
+    if session and session["expires"] <= time.time():
+        sessions.pop(token, None)
+        session = None
+    return public(session["user"]) if session else None
+
+
+# ---- login throttling: slows password guessing without letting an attacker flood the audit log ----
+LOGIN_WINDOW_S = int(os.getenv("LOGIN_WINDOW_S", "300"))
+MAX_FAILS_PER_USER = int(os.getenv("LOGIN_MAX_FAILS_PER_USER", "5"))     # per (client, username)
+MAX_FAILS_PER_CLIENT = int(os.getenv("LOGIN_MAX_FAILS_PER_CLIENT", "20"))  # per client, across usernames
+_fails: dict[tuple, deque] = defaultdict(deque)
+
+
+def _recent(key: tuple) -> deque:
+    q, now = _fails[key], time.time()
+    while q and now - q[0] > LOGIN_WINDOW_S:
+        q.popleft()
+    if not q:
+        _fails.pop(key, None)
+    return q
+
+
+def login_blocked(client: str, username: str) -> bool:
+    return len(_recent((client, username))) >= MAX_FAILS_PER_USER or len(_recent((client, "*"))) >= MAX_FAILS_PER_CLIENT
+
+
+def login_failed(client: str, username: str) -> bool:
+    """Count a failed login. Returns True when this failure is the one that starts a lockout."""
+    was = login_blocked(client, username)
+    now = time.time()
+    _fails[(client, username)].append(now)
+    _fails[(client, "*")].append(now)
+    if len(_fails) > 20_000:
+        _fails.pop(next(iter(_fails)))
+    return not was and login_blocked(client, username)
+
+
+def login_succeeded(client: str, username: str) -> None:
+    _fails.pop((client, username), None)
+
+
+def reset_throttle() -> None:
+    _fails.clear()
 
 
 def can_see(user: dict, device_id: str | None) -> bool:

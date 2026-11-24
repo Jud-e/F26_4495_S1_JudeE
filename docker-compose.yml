@@ -8,7 +8,7 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     ports:
-      - "2181:2181"
+      - "127.0.0.1:2181:2181"
 
   kafka:
     image: confluentinc/cp-kafka:7.6.0
@@ -25,14 +25,14 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     ports:
-      - "29092:29092"   # what your local Python scripts connect to
+      - "127.0.0.1:29092:29092"   # what your local Python scripts connect to (this machine only)
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # One-shot job: creates the isolation commands topic as a COMPACTED topic, so Kafka keeps the
+  # One-shot job: creates the isolation commands topic as a COMPACTED topic (and the dead-letter topic for refused messages, kept 7 days), so Kafka keeps the
   # latest command per device forever and the gateway can rebuild its isolated-device list after a restart.
   kafka-init:
     image: confluentinc/cp-kafka:7.6.0
@@ -41,10 +41,16 @@ services:
       kafka:
         condition: service_healthy
     restart: "no"
-    command: >
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists
-      --topic ${TOPIC_ACTIONS:-iomt.actions} --partitions 1 --replication-factor 1
-      --config cleanup.policy=compact
+    command:
+      - sh
+      - -c
+      - >
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists
+        --topic ${TOPIC_ACTIONS:-iomt.actions} --partitions 1 --replication-factor 1
+        --config cleanup.policy=compact &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists
+        --topic ${TOPIC_TELEMETRY_REJECTED:-iomt.telemetry.rejected} --partitions 1 --replication-factor 1
+        --config retention.ms=604800000
 
   # Optional but very useful while developing: a GUI to see topics/messages
   kafka-ui:
@@ -53,7 +59,7 @@ services:
     depends_on:
       - kafka
     ports:
-      - "8085:8080"
+      - "127.0.0.1:8085:8080"   # unauthenticated admin UI: this machine only
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
@@ -71,7 +77,8 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS_INTERNAL:-kafka:9092}
       TOPIC_TELEMETRY_RAW: ${TOPIC_TELEMETRY_RAW:-iomt.telemetry.raw}
-      GATEWAY_API_TOKEN: ${GATEWAY_API_TOKEN:-dev-shared-secret-change-me}
+      GATEWAY_API_TOKEN: ${GATEWAY_API_TOKEN:?Set GATEWAY_API_TOKEN in .env (see .env.example)}
+      TOPIC_TELEMETRY_REJECTED: ${TOPIC_TELEMETRY_REJECTED:-iomt.telemetry.rejected}
       TOPIC_ACTIONS: ${TOPIC_ACTIONS:-iomt.actions}
     volumes:
       - ./gateway:/app   # live code reload while developing
@@ -114,7 +121,6 @@ services:
       TOPIC_TELEMETRY_RAW: ${TOPIC_TELEMETRY_RAW:-iomt.telemetry.raw}
       TOPIC_TELEMETRY_SCORED: ${TOPIC_TELEMETRY_SCORED:-iomt.telemetry.scored}
       MODEL_PATH: /ml/models/isolation_forest.joblib
-      PYTHONUNBUFFERED: 1
     volumes:
       - ./ml:/ml:ro   # the trained model and risk_scoring.py; train with the steps in stream/consumer.py
 

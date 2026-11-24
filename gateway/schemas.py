@@ -19,6 +19,13 @@ from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Identifiers are lowercase and restricted, so look-alikes ("PUMP-1", "pump-1 ", zero-width characters) cannot be
+# used to dodge the isolation list, and nothing hostile reaches Kafka, logs or the dashboard.
+DEVICE_ID = r"^[a-z0-9][a-z0-9._-]{0,63}$"
+MESSAGE_ID = r"^[A-Za-z0-9._:-]{1,64}$"
+PATIENT_ID = r"^[A-Za-z0-9._-]{1,32}$"
+UNIT = r"^[A-Za-z0-9 ._-]{1,32}$"
+
 
 class DeviceConfig(BaseModel):
     """Reported device configuration state, used for vulnerability checks
@@ -34,20 +41,20 @@ class DeviceConfig(BaseModel):
 class TelemetryCommon(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    message_id: str
-    device_id: str
-    patient_id: str
-    unit: str
+    message_id: str = Field(pattern=MESSAGE_ID)
+    device_id: str = Field(pattern=DEVICE_ID)
+    patient_id: str = Field(pattern=PATIENT_ID)
+    unit: str = Field(pattern=UNIT)
     timestamp: datetime
     packet_size_bytes: int = Field(ge=0, le=65535)
-    request_rate_per_min: float = Field(ge=0)
+    request_rate_per_min: float = Field(ge=0, le=100_000, allow_inf_nan=False)
     config: Optional[DeviceConfig] = None
 
 
 class InfusionPumpTelemetry(TelemetryCommon):
     device_type: Literal["infusion_pump"]
-    infusion_rate_ml_per_hr: float = Field(ge=0, le=5000)
-    occlusion_pressure_mmHg: float = Field(ge=0, le=500)
+    infusion_rate_ml_per_hr: float = Field(ge=0, le=5000, allow_inf_nan=False)
+    occlusion_pressure_mmHg: float = Field(ge=0, le=500, allow_inf_nan=False)
     battery_pct: int = Field(ge=0, le=100)
 
 

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import { Chips, DeviceLabel, Peaks, RiskCell, TopBar } from "../components/parts";
-import { ago, clock, explain, readings } from "../format";
+import { Chips, DeviceLabel, ExportButtons, FixForm, FixInfo, RiskCell, StatusPill, TopBar, isOpen, statusOf } from "../components/parts";
+import RiskChart, { PeriodPicker } from "../components/riskChart";
+import { ago, clock, explain, readings, riskClass } from "../format";
 import { useLive, useTick } from "../hooks/useLive";
 import type { Alert, AuditEntry, Device, User } from "../types";
 
@@ -15,20 +16,23 @@ function Tile({ label, n, cls = "" }: { label: string; n: number; cls?: string }
 
 function AlertRow({ a }: { a: Alert }) {
   return (
-    <li className={a.severity + (a.ack ? " acked" : "")}>
+    <li className={a.severity + (a.ack ? " acked" : "") + (statusOf(a) === "verified" ? " verified" : "")}>
       <div className="row">
-        <div><span className={"pill " + (a.severity === "high" ? "crit" : "warn")}>{a.severity}</span> <strong>{a.device_id}</strong></div>
+        <div><span className={"pill " + (a.severity === "high" ? "crit" : "warn")}>{a.severity}</span> <StatusPill a={a} /> <strong>{a.device_id}</strong></div>
         <span className="sub">{ago(a.at)} · risk {a.risk_score}</span>
       </div>
       <Chips items={a.reasons} />
       {a.explanations?.map((e) => <div key={e} className="sub">Why: {explain(e)}</div>)}
       <div className="sub">{a.ack ? `Acknowledged by ${a.ack.by} ${ago(a.ack.at)}` : "Not yet acknowledged"}</div>
+      <FixInfo a={a} />
+      <FixForm a={a} />
     </li>
   );
 }
 
-function DevicesTable({ devices }: { devices: Device[] }) {
+function DevicesGrid({ devices }: { devices: Device[] }) {
   const [busy, setBusy] = useState("");
+  const [minutes, setMinutes] = useState(60);
   async function toggle(d: Device) {
     if (!d.isolated && !window.confirm(`Isolate ${d.device_id}? The gateway will refuse its messages until you restore it.`)) return;
     setBusy(d.device_id);
@@ -38,21 +42,29 @@ function DevicesTable({ devices }: { devices: Device[] }) {
   }
   return (
     <>
-      <div className="scroll"><table>
-        <thead><tr><th>Device</th><th>Risk</th><th>Flags</th><th>Readings</th><th>Last seen</th><th>Action</th></tr></thead>
-        <tbody id="devices">
-          {devices.map((d) => (
-            <tr key={d.device_id} className={d.isolated ? "isolated" : ""}>
-              <td><DeviceLabel d={d} /></td>
-              <td><RiskCell d={d} /><Peaks d={d} />{d.model_version && <div className="sub mono">{d.model_version}</div>}</td>
-              <td>{d.flags.length ? <Chips items={d.flags} /> : <span className="sub">none</span>}</td>
-              <td className="sub">{readings(d.vitals)}</td>
-              <td className="sub">{ago(d.last_seen)}</td>
-              <td><button className={"small " + (d.isolated ? "" : "danger")} disabled={busy === d.device_id} onClick={() => toggle(d)}>{d.isolated ? "Restore" : "Isolate"}</button></td>
-            </tr>
-          ))}
-        </tbody>
-      </table></div>
+      <div className="toolbar">
+        <PeriodPicker minutes={minutes} onChange={setMinutes} />
+        <span className="sub">Highest risk score per time slot. Dashed line: alert threshold (70).</span>
+      </div>
+      <div className="devgrid" id="devices">
+        {devices.map((d) => (
+          <div key={d.device_id} className={"devcard" + (d.isolated ? " isolated" : "")}>
+            <div className="head">
+              <DeviceLabel d={d} />
+              <div className={"big " + riskClass(d.risk_score)}>{d.risk_score}<small>now</small></div>
+            </div>
+            <RiskChart deviceId={d.device_id} minutes={minutes} />
+            {d.flags.length ? <Chips items={d.flags} /> : <span className="sub">No flags</span>}
+            {d.risk_reasons?.length ? <div className="sub">Why: {d.risk_reasons.map(explain).join("; ")}</div> : null}
+            <div className="sub">{readings(d.vitals)}</div>
+            <div className="sub">Last seen {ago(d.last_seen)}{d.model_version && <> · <span className="mono">{d.model_version}</span></>}</div>
+            <div className="actions">
+              <button className={"small " + (d.isolated ? "" : "danger")} disabled={busy === d.device_id} onClick={() => toggle(d)}>{d.isolated ? "Restore" : "Isolate"}</button>
+              <ExportButtons path={`/api/devices/${encodeURIComponent(d.device_id)}/history`} query={`minutes=${minutes}`} label="Risk" />
+            </div>
+          </div>
+        ))}
+      </div>
       {devices.length === 0 && <div className="empty">No devices yet.</div>}
     </>
   );
@@ -70,6 +82,10 @@ function AuditTable({ audit }: { audit: AuditEntry[] }) {
         <label className="f">Action<select id="f-action" value={action} onChange={(e) => setAction(e.target.value)}><option value="">All actions</option>{actions.map((a) => <option key={a}>{a}</option>)}</select></label>
         <label className="f">User<select id="f-user" value={user} onChange={(e) => setUser(e.target.value)}><option value="">All users</option>{users.map((u) => <option key={u}>{u}</option>)}</select></label>
         <label className="f">Search<input id="f-text" placeholder="device, detail..." value={text} onChange={(e) => setText(e.target.value)} /></label>
+        <div className="f grow" style={{ alignSelf: "flex-end", textAlign: "right" }}>
+          <ExportButtons path="/api/audit/export" label="Export log"
+            query={[action && "action=" + encodeURIComponent(action), user && "user_filter=" + encodeURIComponent(user), text && "q=" + encodeURIComponent(text)].filter(Boolean).join("&")} />
+        </div>
       </div>
       <div className="scroll"><table>
         <thead><tr><th>Time</th><th>User</th><th>Role</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
@@ -115,7 +131,8 @@ export default function Admin({ user }: { user: User }) {
   useEffect(() => { history.replaceState(null, "", "#" + tab); }, [tab]);
   useEffect(() => { api<AuditEntry[]>("/api/audit").then(loadAudit).catch(() => {}); }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
-  const open = alerts.filter((a) => !a.ack);
+  const open = alerts.filter(isOpen);
+  const rechecking = alerts.filter((a) => statusOf(a) === "fixed");
 
   return (
     <>
@@ -134,7 +151,8 @@ export default function Admin({ user }: { user: User }) {
             <div className="tiles" id="tiles">
               <Tile label="Devices" n={devices.length} />
               <Tile label="High risk (70+)" n={devices.filter((d) => d.risk_score >= 70).length} cls="crit" />
-              <Tile label="Unacknowledged alerts" n={open.length} cls={open.length ? "warn" : ""} />
+              <Tile label="Open problems" n={open.length} cls={open.length ? "warn" : ""} />
+              <Tile label="Fixed, rechecking" n={rechecking.length} />
               <Tile label="Isolated" n={devices.filter((d) => d.isolated).length} />
             </div>
             <div className="cols" style={{ marginTop: 18 }}>
@@ -157,21 +175,21 @@ export default function Admin({ user }: { user: User }) {
 
         {tab === "devices" && (
           <section role="tabpanel" className="panel">
-            <h2>All devices</h2>
-            <DevicesTable devices={devices} />
+            <h2>Devices: risk over time</h2>
+            <DevicesGrid devices={devices} />
             <p className="note">Isolating a device makes the gateway refuse its messages (HTTP 403) until you restore it. Every command is audited.</p>
           </section>
         )}
 
         {tab === "alerts" && (
           <section role="tabpanel" className="panel">
-            <h2>All alerts</h2>
+            <div className="toolbar"><h2 style={{ margin: 0 }}>All alerts</h2><ExportButtons path="/api/alerts/export" label="Export alerts" /></div>
             <ul className="alerts">{alerts.slice(0, 100).map((a) => <AlertRow key={a.id} a={a} />)}</ul>
             {alerts.length === 0 && <div className="empty">No alerts yet.</div>}
           </section>
         )}
 
-        {tab === "audit" && <section role="tabpanel" className="panel"><h2>Audit log</h2><AuditTable audit={audit} /></section>}
+        {tab === "audit" && <section role="tabpanel" className="panel"><h2>Audit log</h2><p className="note" style={{ marginTop: 0 }}>Export downloads the full stored log that matches the filters below, not only the rows shown. Each export is itself audited.</p><AuditTable audit={audit} /></section>}
 
         {tab === "access" && (
           <section role="tabpanel" className="panel">

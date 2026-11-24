@@ -30,7 +30,7 @@ stream consumer: preprocessing, risk score  ->  Kafka: iomt.telemetry.scored
 
 ### What is built
 
-- **Gateway:** bearer-token authentication, Pydantic schema validation per device type, configuration checks (auto-lock off, default credentials, outdated firmware, TLS off), prescription-mismatch check for infusion pumps, TLS.
+- **Gateway:** per-device bearer tokens, rate limits, replay and timestamp checks, a dead-letter topic, Pydantic schema validation per device type, configuration checks (auto-lock off, default credentials, outdated firmware, TLS off), prescription-mismatch check for infusion pumps, TLS.
 - **Simulator:** five devices with deliberate weaknesses and injected attacks, plus a ground-truth log for evaluating the model.
 - **Stream:** preprocessing into a fixed numeric feature vector, published to a scored topic.
 - **Dashboard API:** live device state and alerts over a WebSocket, de-duplicated alerts, mocked sign-in with admin and nurse roles enforced on the server, acknowledgement, isolate and restore buttons, and an audit log.
@@ -38,10 +38,8 @@ stream consumer: preprocessing, risk score  ->  Kafka: iomt.telemetry.scored
 
 ### Not built yet
 
-- The Isolation Forest and Autoencoder scores (the risk score is a placeholder until the model is integrated).
-- Per-device authentication (the gateway uses one shared token and trusts `device_id`).
-- Gateway enforcement of isolation (isolating a device is recorded and audited but not yet blocked).
-- Postgres persistence (alerts and the audit log are held in memory and reset on restart).
+- Autoencoder scoring (the live model is an Isolation Forest plus a per-device-type range check).
+- Remediation workflow (flagged, fix, marked fixed, rechecked).
 - Real user accounts and single sign-on.
 
 ## Quick start (Windows)
@@ -74,13 +72,17 @@ cd ..
 
 `key.pem` and `cert.pem` are git-ignored, so each team member creates their own.
 
-### 3. Install the simulator dependencies (once)
+### 3. Create `.env` (once)
+
+Copy `.env.example` to `.env` and set both values: `POSTGRES_PASSWORD`, and `GATEWAY_API_TOKEN` (generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`). Docker Compose will not start without them, and `run-demo.ps1` passes the token to the simulator. `.env` is git-ignored; never commit it.
+
+### 4. Install the simulator dependencies (once)
 
 ```powershell
 pip install -r ingestion/requirements.txt
 ```
 
-### 4. Run everything
+### 5. Run everything
 
 ```powershell
 .\run-demo.ps1
@@ -97,7 +99,7 @@ The script checks mkcert, starts the Docker stack, waits for the gateway to be h
 
 The first run builds the Docker images, which takes a few minutes.
 
-### 5. Open the dashboard
+### 6. Open the dashboard
 
 http://localhost:8100 and sign in with a demo account:
 
@@ -196,12 +198,20 @@ It checks sign-in, token rejection, nurse versus admin filtering, alert de-dupli
 
 The gateway runs uvicorn with `--ssl-keyfile=/app/key.pem --ssl-certfile=/app/cert.pem`, using certificates made by mkcert (step 2). If a merge ever drops these flags from the `command:` line of the gateway service in `docker-compose.yml`, the gateway silently falls back to plain HTTP. See issue #4.
 
-## Security notes and limitations
+## Security
+
+The attack scripts in `security/` (`python security/run_pentest.py`) test the gateway, the dashboard API and the compose file. Results, fixes and residual risks are in `security/PENTEST.md`.
+
+- **Device tokens.** Each device authenticates with its own token, HMAC-SHA256 of the device ID under the master secret `GATEWAY_API_TOKEN`. Print one with `python gateway/provision_token.py <device-id>`. The gateway refuses to start if the secret is missing, a known default, or under 16 characters.
+- **Gateway limits.** 16 KB body cap, strict identifier patterns, no NaN or Infinity, timestamps within 5 minutes, replayed `message_id` refused, 120 messages a minute per device, lockout after 10 bad tokens a minute. Refused messages from authenticated devices are copied to the `iomt.telemetry.rejected` topic.
+- **Dashboard.** Sign-in lockout (5 failures per user, 20 per client, per 5 minutes), 8-hour sessions, a content security policy and other browser headers.
+- **Ports.** Kafka, Zookeeper, Kafka UI and Postgres are published on this machine only.
+
+Limitations:
 
 - Sign-in is mocked: accounts and passwords are hard-coded and sessions live in memory.
-- The gateway uses one shared bearer token and trusts the `device_id` a client reports, so it cannot yet prove which device sent a message. Per-device identity (tokens or mTLS) is planned.
-- Isolation is recorded and audited but not yet enforced at the gateway.
-- Alerts and the audit log are in memory and reset when the dashboard service restarts.
+- Kafka inside the Docker network has no authentication, so a production deployment needs SASL or mTLS with ACLs.
+- The dashboard is served over plain HTTP in the demo.
 - Only synthetic data is used. Handling real health data would add privacy requirements (PIPEDA, BC PIPA) that this prototype does not address.
 
 ## Documents

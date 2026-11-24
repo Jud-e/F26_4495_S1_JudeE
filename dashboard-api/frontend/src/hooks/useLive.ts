@@ -27,7 +27,7 @@ function reducer(s: State, a: Action): State {
 }
 
 /** Live device, alert and audit state from the /ws WebSocket, with automatic reconnect. */
-export function useLive(onAlert?: (a: Alert) => void) {
+export function useLive(onAlert?: (a: Alert, reopened: boolean) => void) {
   const [state, dispatch] = useReducer(reducer, initial);
   const [connected, setConnected] = useState(false);
   const alertRef = useRef(onAlert);
@@ -43,7 +43,7 @@ export function useLive(onAlert?: (a: Alert) => void) {
       ws.onopen = () => { opened = true; retry = 1000; setConnected(true); };
       ws.onmessage = (m) => {
         const ev = JSON.parse(m.data) as LiveEvent;
-        if (ev.type === "alert") alertRef.current?.(ev.alert);   // the snapshot's history never triggers this
+        if (ev.type === "alert" || (ev.type === "alert_update" && ev.reopened)) alertRef.current?.(ev.alert, ev.type === "alert_update");   // the snapshot's history never triggers this
         dispatch(ev);
       };
       ws.onclose = async () => {
